@@ -3,9 +3,14 @@
 # LLVM IR module with llc, lift its machine code back to LLVM IR
 # (agx_lift.py) and check with alive-tv that the machine code refines the IR.
 #
-#   agx-tv [-mcpu=agx-g14c] [--keep DIR] [--asm FILE] kernel.ll [alive-tv options...]
+#   agx-tv [-mcpu=agx-g14c] [--keep DIR] [--asm FILE] [--exact-alignment]
+#          kernel.ll [alive-tv options...]
 #
 # --asm lifts the given assembly instead of llc's.
+#
+# Device buffer arguments are taken to be 16-byte aligned, as the drivers
+# allocate them (agx_lift.py, BUFFER_ALIGN: much faster to check);
+# --exact-alignment checks every alignment.
 #
 # Without the AGX feature ieee-fp32 the backend compiles float arithmetic for
 # the hardware's: denormals flushed (llvm/docs/AGXUsage.rst, "Strict floating
@@ -24,12 +29,14 @@ cpu=agx-g14c
 keep=
 asm=
 ieee=
+liftflag=()
 while [[ $# -gt 0 ]]; do
   case $1 in
     -mcpu=*) cpu=${1#-mcpu=}; shift ;;
     --keep) keep=$2; shift 2 ;;
     --asm) asm=$2; shift 2 ;;
     --ieee) ieee=1; shift ;;
+    --exact-alignment) liftflag+=(--exact-alignment); shift ;;
     *) break ;;
   esac
 done
@@ -49,7 +56,7 @@ if [[ -z $ieee ]] && ! grep -qE '"target-features"="[^"]*\+ieee-fp32' "$in"; the
 fi
 status=0
 for k in $(grep -oP '^define\s+agx_kernel\s+void\s+@\K[A-Za-z0-9_.$]+' "$in"); do
-  if ! python3 "$here/agx_lift.py" "$in" "$dir/out.s" "$k" -o "$dir/$k.lifted.raw.ll" "${srcflag[@]}"; then
+  if ! python3 "$here/agx_lift.py" "$in" "$dir/out.s" "$k" -o "$dir/$k.lifted.raw.ll" "${srcflag[@]}" "${liftflag[@]}"; then
     status=2; continue
   fi
   # Registers to SSA values (the lifter keeps them in allocas).

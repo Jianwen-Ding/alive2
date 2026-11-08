@@ -27,6 +27,14 @@ signature:
   `threadgroups_per_grid` and the constants of extension 6 too. A pointer
   argument stays a pointer: an address based on its uniforms is a
   `getelementptr` from it, so alive2 sees its provenance.
+* Device buffer arguments are 16-byte aligned, as the drivers allocate them:
+  the lifted function's pointer parameters say `align 16`, so a launch with
+  a misaligned buffer is not checked. The GPU rounds an access's address
+  down to its item size; with aligned buffers every access is then aligned
+  to its item, which the lifted loads and stores say, and alive2 need not
+  model bytes or the buffers' addresses (`tests/guarded.ll` 14 s -> 2 s).
+  `--exact-alignment` checks every alignment, rounding the address as the
+  GPU does.
 * Registers hold bits, never poison: the general registers start as unknown
   values (`freeze poison`), an argument that is poison in the IR is some
   value in its uniforms, and a 16-bit half written into a register is
@@ -41,7 +49,8 @@ signature:
   counter follows applegpu's pseudocode for `if`, `else`, `while`, `push`
   and `pop`; `jmp_exec_none` is taken when the thread is inactive and
   `jmp_exec_any` when it is active: one of the executions, the others
-  differing only in masked instructions.
+  differing only in masked instructions. Past a `jmp_exec_none` the counter
+  is 0, so the instructions up to its next change are lifted unmasked.
 * Threadgroup memory is the kernel's threadgroup variable (one per kernel;
   the backend places it at 0), addressed as BASE + 4 * size * INDEX; its
   loads write their registers at once.

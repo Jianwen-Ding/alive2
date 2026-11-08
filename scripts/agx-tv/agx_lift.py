@@ -66,6 +66,25 @@ class Param:
     self.byref = b.group(1) if b else None
 
 
+# The launch contract of the lifted kernel: device buffer arguments are
+# aligned to 16 bytes (Metal's and the CUDA drivers' allocations are; the
+# lifted function says so with align 16, so that an argument that is not is
+# poison there and such launches are not checked). The GPU rounds an access's
+# address down to its item size; with aligned buffers and offsets in items,
+# every access is aligned, and its alignment spares alive2 modeling bytes and
+# addresses (guarded.ll: 14 s -> 2 s). --exact-alignment drops the contract
+# (then accesses are byte-aligned, and buffers' addresses rounded).
+BUFFER_ALIGN = 16
+
+
+def buffer_align(p):
+  """A device pointer parameter's text with the contract's alignment."""
+  if (p.type != 'ptr addrspace(1)' or p.byref or
+      re.search(r'\balign \d+', p.text)):
+    return p.text
+  return p.text.replace(p.type, '%s align %d' % (p.type, BUFFER_ALIGN), 1)
+
+
 def parse_signature(ll, name):
   m = re.search(r'^define\s+(.*?)@' + re.escape(name) + r'\(', ll, re.M)
   if not m:
@@ -328,6 +347,7 @@ class Lifter:
     self.nest = 0           # the nesting counter's value where known
     self.lazy = {}          # uniform half -> (byref param, byte, size)
     self.tgvar = None       # the threadgroup variable, '@name'
+    self.exact_align = False  # no buffer alignment contract (BUFFER_ALIGN)
     self.shadows = []       # the allocas of pending load results
 
   # -- values ---------------------------------------------------------------
@@ -657,6 +677,15 @@ class Lifter:
     off = self.op('shl i64 %s, %d' % (x, scale)) if scale else x
     if p is not None:
       # The pointer argument itself: an offset from it.
+      # Device buffers are aligned to BUFFER_ALIGN (the lifted function's
+      # contract, see buffer_align), so the GPU's rounding of the address
+      # down to the item size changes nothing; without the contract, the
+      # offset less the argument's address mod the item size.
+      assert esz <= BUFFER_ALIGN
+      if self.exact_align and esz > 1:
+        pi = self.op('ptrtoint %s %s to i64' % (p.type, p.name))
+        m = self.op('and i64 %s, %d' % (pi, esz - 1))
+        off = self.op('sub i64 %s, %s' % (off, m))
       return self.op('getelementptr i8, %s %s, i64 %s' % (p.type, p.name, off))
     b = self.read(base, 64, signed=False)
     if esz > 1:
@@ -828,6 +857,11 @@ class Lifter:
       t, f = ('"%s"' % ops[0], nxt) if mn == 'jmp_exec_any' else (nxt, '"%s"' % ops[0])
       self.emit('br i1 %s, label %%%s, label %%%s' % (a, t.strip('"') if t == nxt else t, f if f != nxt else nxt))
       self.lines.append('%s:' % nxt)
+      if mn == 'jmp_exec_none':
+        # Falling through, the thread is active: the counter is 0 here
+        # (stored as such, so that the masked instructions up to the next
+        # change of it are unconditional, without a test per instruction).
+        self.store_r0l('0')
       return False
     if mn in ('if_icmp', 'if_fcmp', 'else_icmp', 'else_fcmp', 'while_icmp',
               'while_fcmp'):
@@ -1275,7 +1309,9 @@ class Lifter:
         reg = Operand(parts[k])
         rbits = reg.bits
         if mn == 'device_load':
-          v = self.op('load %s, ptr addrspace(1) %s, align 1' % (ty, q))
+          # Aligned to the item: the base rounds down to it and the offsets
+          # are multiples of it (which spares alive2 modeling single bytes).
+          v = self.op('load %s, ptr addrspace(1) %s, align %d' % (ty, q, esz))
           if 8 * esz < rbits:
             v = self.op('zext %s %s to i%d' % (ty, v, rbits))
           # Its registers are written at the wait on its slot.
@@ -1287,7 +1323,8 @@ class Lifter:
           self.pending.append((int(g), reg, val, flag, rbits))
         else:
           v = self.read(reg, 8 * esz)
-          self.emit('store %s %s, ptr addrspace(1) %s, align 1' % (ty, v, q))
+          self.emit('store %s %s, ptr addrspace(1) %s, align %d'
+                    % (ty, v, q, esz))
     self.masked(act, body)
 
   # -- the function ---------------------------------------------------------
@@ -1476,6 +1513,9 @@ def main():
   ap.add_argument('asm', help='the assembly llc printed for it (.s)')
   ap.add_argument('function', help='the kernel')
   ap.add_argument('-o', '--output', default='-')
+  ap.add_argument('--exact-alignment', action='store_true',
+                  help='check every buffer alignment, not only %d-byte '
+                  'aligned buffers (slower)' % BUFFER_ALIGN)
   ap.add_argument('--source-out', help='also write the module as checked: '
                   'its kernels\' float denormals flushed (without ieee-fp32)')
   ap.add_argument('--case', help='lift a recorded coverage case instead: '
@@ -1492,6 +1532,7 @@ def main():
     prefix, params, suffix = parse_signature(ll, args.function)
     words, start = kernel_record(asm, args.function)
     lf = Lifter(params, words, start, kernel_body(asm, args.function))
+    lf.exact_align = args.exact_alignment
     tgs = re.findall(r'^(@[\w.$"]+) = [^\n]*addrspace\(3\) global', ll, re.M)
     if len(tgs) == 1:
       lf.tgvar = tgs[0]
@@ -1507,7 +1548,8 @@ def main():
     if env:
       suffix = ' denormal_fpenv(%s)' % env + suffix
     fn = lf.function(args.function, prefix,
-                     ', '.join(p.text for p in params), suffix)
+                     ', '.join(p.text if lf.exact_align else buffer_align(p)
+                               for p in params), suffix)
   except LiftError as e:
     print('agx-lift: cannot lift %s: %s' % (args.function, e), file=sys.stderr)
     return 2
