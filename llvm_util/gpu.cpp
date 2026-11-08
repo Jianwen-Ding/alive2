@@ -1336,6 +1336,10 @@ struct GPUCanonicalizer : ValueMaterializer {
         Work.push_back(&I);
     for (Instruction *I : Work) {
       IRBuilder<> B(I);
+      // Atomics of the thread alone are its accesses.
+      if (auto *RMW = dyn_cast<AtomicRMWInst>(I);
+          RMW && RMW->getSyncScopeID() == SyncScope::SingleThread)
+        RMW->setOrdering(AtomicOrdering::Monotonic);
       auto ordered = [](AtomicOrdering O) {
         return isStrongerThanMonotonic(O);
       };
@@ -1344,8 +1348,9 @@ struct GPUCanonicalizer : ValueMaterializer {
         fence(A);
       };
       if (auto *Fe = dyn_cast<FenceInst>(I)) {
-        (void)Fe;
-        fence(B);
+        // A fence of the thread alone orders nothing for other threads.
+        if (Fe->getSyncScopeID() != SyncScope::SingleThread)
+          fence(B);
         I->eraseFromParent();
       } else if (auto *L = dyn_cast<LoadInst>(I)) {
         if (ordered(L->getOrdering()))

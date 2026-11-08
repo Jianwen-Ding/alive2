@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Translation validation of the AGX backend: compile each kernel of an AGX
+# LLVM IR module with llc, lift its machine code back to LLVM IR
+# (agx_lift.py) and check with alive-tv that the machine code refines the IR.
+#
+#   agx-tv [-mcpu=agx-g14c] [--keep DIR] [--asm FILE] kernel.ll [alive-tv options...]
+#
+# --asm lifts the given assembly instead of llc's.
+#
+# Without the AGX feature ieee-fp32 the backend compiles float arithmetic for
+# the hardware's: denormals flushed (llvm/docs/AGXUsage.rst, "Strict floating
+# point"). The kernel is then checked as a function whose float denormals
+# flush (denormal-fp-math-f32 preserve-sign), the contract it is compiled
+# for; --ieee checks it against IEEE arithmetic instead.
+#
+# LLC, OPT and ALIVE_TV name the tools (default: on PATH, or next to this
+# script's build: ../../build).
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+LLC=${LLC:-llc}
+OPT=${OPT:-opt}
+ALIVE_TV=${ALIVE_TV:-alive-tv}
+cpu=agx-g14c
+keep=
+asm=
+ieee=
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -mcpu=*) cpu=${1#-mcpu=}; shift ;;
+    --keep) keep=$2; shift 2 ;;
+    --asm) asm=$2; shift 2 ;;
+    --ieee) ieee=1; shift ;;
+    *) break ;;
+  esac
+done
+in=$1; shift
+dir=${keep:-$(mktemp -d)}
+mkdir -p "$dir"
+if [[ -n $asm ]]; then
+  cp "$asm" "$dir/out.s"
+else
+  "$LLC" -mtriple=agx -mcpu="$cpu" "$in" -o "$dir/out.s"
+fi
+src=$in
+srcflag=()
+if [[ -z $ieee ]] && ! grep -qE '"target-features"="[^"]*\+ieee-fp32' "$in"; then
+  src=$dir/src.ll
+  srcflag=(--source-out "$src")
+fi
+status=0
+for k in $(grep -oP '^define\s+agx_kernel\s+void\s+@\K[A-Za-z0-9_.$]+' "$in"); do
+  if ! python3 "$here/agx_lift.py" "$in" "$dir/out.s" "$k" -o "$dir/$k.lifted.raw.ll" "${srcflag[@]}"; then
+    status=2; continue
+  fi
+  # Registers to SSA values (the lifter keeps them in allocas).
+  "$OPT" -passes=sroa,mem2reg -S "$dir/$k.lifted.raw.ll" -o "$dir/$k.lifted.ll"
+  echo "== $k"
+  "$ALIVE_TV" "$src" "$dir/$k.lifted.ll" -func="$k" "$@" || status=1
+done
+[[ -z $keep ]] && rm -rf "$dir"
+exit $status
