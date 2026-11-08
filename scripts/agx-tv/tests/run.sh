@@ -37,6 +37,7 @@ if [[ -n ${EXACT:-} ]]; then
   expect correct "guarded verifies (exact alignment)" --exact-alignment \
     "$here/guarded.ll" -smt-to=900000
 fi
+expect correct "scalar64 verifies" "$here/scalar64.ll"
 expect correct "threadgroup verifies" --keep "$tmp/threadgroup" \
   "$here/threadgroup.ll"
 # alive2 checks loops unrolled to a bound.

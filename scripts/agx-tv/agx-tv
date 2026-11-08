@@ -59,6 +59,13 @@ for k in $(grep -oP '^define\s+agx_kernel\s+void\s+@\K[A-Za-z0-9_.$]+' "$in"); d
   if ! python3 "$here/agx_lift.py" "$in" "$dir/out.s" "$k" -o "$dir/$k.lifted.raw.ll" "${srcflag[@]}" "${liftflag[@]}"; then
     status=2; continue
   fi
+  # The source as opt reads it, without passes: a module without a
+  # datalayout gets the target's, as the lifted code does (else their
+  # scalars' constant buffers differ in alignment).
+  if [[ $src != "$dir/src.opt.ll" ]]; then
+    "$OPT" -passes=verify -S "$src" -o "$dir/src.opt.ll"
+    src=$dir/src.opt.ll
+  fi
   # Registers to SSA values (the lifter keeps them in allocas).
   "$OPT" -passes=sroa,mem2reg -S "$dir/$k.lifted.raw.ll" -o "$dir/$k.lifted.ll"
   echo "== $k"
