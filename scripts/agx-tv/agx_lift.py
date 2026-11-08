@@ -77,12 +77,30 @@ class Param:
 BUFFER_ALIGN = 16
 
 
-def buffer_align(p):
-  """A device pointer parameter's text with the contract's alignment."""
-  if (p.type != 'ptr addrspace(1)' or p.byref or
-      re.search(r'\balign \d+', p.text)):
-    return p.text
-  return p.text.replace(p.type, '%s align %d' % (p.type, BUFFER_ALIGN), 1)
+def lifted_param(p, align):
+  """A parameter's text in the lifted function: without capture attributes
+  (the lifted code takes pointer arguments' addresses apart, which they
+  would make poison; dropping them only weakens the target's assumptions),
+  and a device pointer with the contract's alignment."""
+  t = re.sub(r'\s*\b(captures\([^)]*\)|nocapture)', '', p.text)
+  if (not align or p.type != 'ptr addrspace(1)' or p.byref or
+      re.search(r'\balign \d+', t)):
+    return t
+  return t.replace(p.type, '%s align %d' % (p.type, BUFFER_ALIGN), 1)
+
+
+def one_line_headers(ll):
+  """The module with each function definition's header on one line."""
+  out, lines, i = [], ll.split('\n'), 0
+  while i < len(lines):
+    l = lines[i]
+    if l.startswith('define ') and '{' not in l:
+      while i + 1 < len(lines) and '{' not in l:
+        i += 1
+        l = l.rstrip() + ' ' + lines[i].strip()
+    out.append(l)
+    i += 1
+  return '\n'.join(out)
 
 
 def parse_signature(ll, name):
@@ -1524,7 +1542,7 @@ def main():
   args = ap.parse_args()
   if args.case:
     return main_case(args)
-  ll = open(args.ir).read()
+  ll = one_line_headers(open(args.ir).read())
   asm = open(args.asm).read()
   if args.source_out:
     open(args.source_out, 'w').write(flushing_source(ll))
@@ -1546,9 +1564,12 @@ def main():
     if not re.search(r'"target-features"="[^"]*\+ieee-fp32', ll):
       env = float_flushes(env)
     if env:
-      suffix = ' denormal_fpenv(%s)' % env + suffix
+      # after (local_)unnamed_addr, before the other function attributes
+      m = re.match(r'\s*((?:local_)?unnamed_addr\b)?', suffix)
+      suffix = (' ' + (m.group(1) or '') + ' denormal_fpenv(%s)' % env +
+                suffix[m.end():])
     fn = lf.function(args.function, prefix,
-                     ', '.join(p.text if lf.exact_align else buffer_align(p)
+                     ', '.join(lifted_param(p, not lf.exact_align)
                                for p in params), suffix)
   except LiftError as e:
     print('agx-lift: cannot lift %s: %s' % (args.function, e), file=sys.stderr)
