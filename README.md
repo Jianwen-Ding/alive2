@@ -363,6 +363,9 @@ What the canonical form says:
   `shuffle_up` of `lane - delta` or, for the lowest lanes, the thread's own
   value, as MSL defines them), so that AIR's shuffles, AGX's and MLIR's lane
   arithmetic compare.
+* AIR and AGX have no floating-point environment to change: outside `strictfp`
+  functions a constrained operation that rounds to nearest and ignores
+  exceptions is the plain operation.
 * alive2 has one address space: the canonical form has none, so memories of
   different spaces may alias there. That only keeps alive2 from proving what
   depends on their being disjoint. `noalias` (which alive2 does not support)
@@ -374,7 +377,11 @@ AGX's `<2 x T>` fragments have no common form), the math functions AGX builds
 in software (`asinh`, `sinpi`, ...), AGX's recovery of software doubles, and
 `air.indirect_buffer` argument buffers. Floating point in memory makes the
 solver slow (`-smt-to`); NaN payloads differ between AIR's software forms and
-the LLVM operations AGX restores (alive2 then reports a mismatch of NaNs).
+the LLVM operations AGX restores: AIR -> AGX then reports a mismatch whose
+operands are NaNs (`ieee-fp32-flag`, `recover-atomic-f64`, minimum/maximum),
+since AIR's software forms return one NaN where LLVM's operations may return
+any; upstream -> AGX, where the front end's operation allowed any NaN,
+verifies.
 
 `tests/alive-tv/gpu` has the three comparisons of real kernels and what they
 found in the AIR target: `__mulhi` computed from the unsigned product, and

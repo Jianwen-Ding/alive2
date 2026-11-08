@@ -698,6 +698,7 @@ struct GPUCanonicalizer : ValueMaterializer {
     MergeBlockIntoPredecessor(Body);
 
     lowerCalls(*NewF);
+    defaultFPEnvironment(*NewF);
     sequentialMemory(*NewF);
     if (config::gpu_print_canonical) {
       config::dbg() << "\n----------------------------------------\n"
@@ -1258,6 +1259,68 @@ struct GPUCanonicalizer : ValueMaterializer {
       return true;
     }
     return false;
+  }
+
+  // -------------------------------------------------------------------------
+  // The floating-point environment.
+
+  /// AIR and AGX have no floating-point environment to change: outside
+  /// strictfp functions it rounds to nearest even and raises nothing, so a
+  /// constrained operation that rounds to nearest (or dynamically) and
+  /// ignores exceptions is the plain operation (agx-lower-air restores AIR's
+  /// software arithmetic as such operations).
+  void defaultFPEnvironment(Function &Fn) {
+    if (Fn.hasFnAttribute(Attribute::StrictFP))
+      return;
+    for (Instruction &I : make_early_inc_range(instructions(Fn))) {
+      auto *C = dyn_cast<ConstrainedFPIntrinsic>(&I);
+      if (!C)
+        continue;
+      std::optional<RoundingMode> RM = C->getRoundingMode();
+      std::optional<fp::ExceptionBehavior> EB = C->getExceptionBehavior();
+      if ((RM && *RM != RoundingMode::NearestTiesToEven &&
+           *RM != RoundingMode::Dynamic) ||
+          (EB && *EB != fp::ebIgnore))
+        continue;
+      IRBuilder<> B(C);
+      Value *A0 = C->getArgOperand(0);
+      Value *R = nullptr;
+      switch (C->getIntrinsicID()) {
+      case Intrinsic::experimental_constrained_fadd:
+        R = B.CreateFAdd(A0, C->getArgOperand(1)); break;
+      case Intrinsic::experimental_constrained_fsub:
+        R = B.CreateFSub(A0, C->getArgOperand(1)); break;
+      case Intrinsic::experimental_constrained_fmul:
+        R = B.CreateFMul(A0, C->getArgOperand(1)); break;
+      case Intrinsic::experimental_constrained_fdiv:
+        R = B.CreateFDiv(A0, C->getArgOperand(1)); break;
+      case Intrinsic::experimental_constrained_frem:
+        R = B.CreateFRem(A0, C->getArgOperand(1)); break;
+      case Intrinsic::experimental_constrained_fma:
+        R = B.CreateIntrinsic(Intrinsic::fma, {C->getType()},
+                              {A0, C->getArgOperand(1), C->getArgOperand(2)});
+        break;
+      case Intrinsic::experimental_constrained_sqrt:
+        R = B.CreateUnaryIntrinsic(Intrinsic::sqrt, A0); break;
+      case Intrinsic::experimental_constrained_fptrunc:
+        R = B.CreateFPTrunc(A0, C->getType()); break;
+      case Intrinsic::experimental_constrained_fpext:
+        R = B.CreateFPExt(A0, C->getType()); break;
+      case Intrinsic::experimental_constrained_sitofp:
+        R = B.CreateSIToFP(A0, C->getType()); break;
+      case Intrinsic::experimental_constrained_uitofp:
+        R = B.CreateUIToFP(A0, C->getType()); break;
+      default:
+        break;
+      }
+      if (!R)
+        continue;
+      if (auto *RI = dyn_cast<Instruction>(R); RI && isa<FPMathOperator>(RI))
+        RI->setFastMathFlags(C->getFastMathFlags());
+      R->takeName(C);
+      C->replaceAllUsesWith(R);
+      C->eraseFromParent();
+    }
   }
 
   // -------------------------------------------------------------------------
