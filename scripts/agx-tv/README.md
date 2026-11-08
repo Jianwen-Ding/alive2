@@ -42,6 +42,9 @@ signature:
   and `pop`; `jmp_exec_none` is taken when the thread is inactive and
   `jmp_exec_any` when it is active: one of the executions, the others
   differing only in masked instructions.
+* Threadgroup memory is the kernel's threadgroup variable (one per kernel;
+  the backend places it at 0), addressed as BASE + 4 * size * INDEX; its
+  loads write their registers at once.
 * A device load writes its registers at the `wait` on its scoreboard slot,
   as the GPU does (a register read before the wait keeps its old value),
   so a missing wait shows as a wrong value.
@@ -90,6 +93,7 @@ in non-default roundings, coherent accesses, and eight stores whose
 neighbouring lanes overlap (the GPU writes them component by component across
 the lanes; in the IR they are races between threads).
 
-Not lifted yet: atomics, threadgroup and stack memory, the SIMD-group
+Not lifted yet: atomics, stack memory, threadgroup memory of more than one
+variable, the SIMD-group
 matrix and transcendental instructions, calls, and kernels with a global data
 buffer or kernel record extensions other than 6.

@@ -19,6 +19,8 @@ expect() {  # expect correct|incorrect DESCRIPTION agx-tv-args...
 }
 tmp=$(mktemp -d)
 expect correct "guarded verifies" --keep "$tmp/guarded" "$here/guarded.ll"
+expect correct "threadgroup verifies" --keep "$tmp/threadgroup" \
+  "$here/threadgroup.ll"
 # alive2 checks loops unrolled to a bound.
 unroll=(-src-unroll=1 -tgt-unroll=1 -smt-to=300000)
 expect correct "loop verifies (one iteration)" --keep "$tmp/loop" \
@@ -36,6 +38,7 @@ mutate condition guarded 's/if_icmp r0l, slt/if_icmp r0l, sgt/'
 mutate immediate guarded 's/xor\t\(r[0-9]*\), \(r[0-9]*\), 255/xor\t\1, \2, 254/'
 mutate buffer guarded 's/u0_u1, r1, signed/u2_u3, r1, signed/'
 mutate wait guarded '/^\twait 0$/d'
+mutate tg-index threadgroup 's/threadgroup_store i32, x, \(r[0-9]*\), \(r[0-9]*l\), 0/threadgroup_store i32, x, \1, \2, 1/'
 mutate loop-body loop 's/iadd[ \t]*\(r[0-9]*\), \1, \(r[0-9]*\)$/isub \1, \1, \2/' "${unroll[@]}"
 rm -rf "$tmp"
 exit $fail

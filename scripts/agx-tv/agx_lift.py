@@ -327,6 +327,7 @@ class Lifter:
     self.last_fence = False  # the last instruction but waits was a barrier
     self.nest = 0           # the nesting counter's value where known
     self.lazy = {}          # uniform half -> (byref param, byte, size)
+    self.tgvar = None       # the threadgroup variable, '@name'
     self.shadows = []       # the allocas of pending load results
 
   # -- values ---------------------------------------------------------------
@@ -1027,6 +1028,9 @@ class Lifter:
     if mn in ('device_load', 'device_store'):
       self.device_mem(mn, ops, shift, act)
       return False
+    if mn in ('threadgroup_load', 'threadgroup_store'):
+      self.threadgroup_mem(mn, ops, act)
+      return False
     if mn == 'memory_barrier':
       # Orders the thread's memory accesses for others (alive2's GPU
       # semantics: a fence). Barriers with nothing but waits between them
@@ -1196,6 +1200,49 @@ class Lifter:
       self.decl('declare i%d @%s(%s)' % (bits, fn, fty))
       v = self.op('call i%d @%s(%s %s)' % (bits, fn, fty, x))
       self.write(d, v, bits, act)
+
+  def threadgroup_mem(self, mn, ops, act):
+    """threadgroup_load / threadgroup_store FMT, MASK, R, BASE, INDEX: the
+    bytes BASE + 4 * size * INDEX + size * component of threadgroup memory
+    (written to the registers at once, unlike a device load)
+    (the AGX Performance Simulator's tg_words, a recorded finding), BASE a
+    16-bit register, a uniform or 0 and INDEX a 16-bit register or an
+    immediate. Threadgroup memory is the kernel's threadgroup variable (the
+    backend places it at 0); a load that would read beyond it reads 0 and
+    a store there is dropped on the GPU, which here is beyond the variable."""
+    if self.tgvar is None:
+      raise LiftError('threadgroup memory other than one threadgroup variable')
+    fmt, mask, R, base, idx = ops[0], ops[1], ops[2], ops[3], ops[4]
+    if fmt not in MEM_BYTES:
+      raise LiftError('threadgroup format ' + fmt)
+    esz = MEM_BYTES[fmt]
+    ty = 'i%d' % (8 * esz)
+    positions = ['xyzw'.index(c) for c in mask]
+    parts = R.split('_')
+    Bo, Io = Operand(base), Operand(idx)
+
+    def body():
+      b = self.read(Bo, 32, signed=False) if (Bo.is_reg or Bo.imm) else '0'
+      i = self.read(Io, 32, signed=False)
+      off = self.op('mul i32 %s, %d' % (i, 4 * esz))
+      a = self.op('add i32 %s, %s' % (b, off))
+      a = self.op('zext i32 %s to i64' % a)
+      p = self.op('getelementptr i8, ptr addrspace(3) %s, i64 %s' % (self.tgvar, a))
+      for k, pos in enumerate(positions):
+        q = self.op('getelementptr i8, ptr addrspace(3) %s, i64 %d'
+                    % (p, pos * esz)) if pos else p
+        reg = Operand(parts[k])
+        if mn == 'threadgroup_load':
+          v = self.op('load %s, ptr addrspace(3) %s, align 1' % (ty, q))
+          if 8 * esz < reg.bits:
+            v = self.op('zext %s %s to i%d' % (ty, v, reg.bits))
+          # Threadgroup loads write their registers at once (the simulator's
+          # tg_mem; the backend waits for none).
+          self.write(reg, v, reg.bits, 'true')
+        else:
+          v = self.read(reg, 8 * esz)
+          self.emit('store %s %s, ptr addrspace(3) %s, align 1' % (ty, v, q))
+    self.masked(act, body)
 
   def device_mem(self, mn, ops, shift, act):
     g, fmt, mask = ops[0], ops[1], ops[2]
@@ -1445,6 +1492,9 @@ def main():
     prefix, params, suffix = parse_signature(ll, args.function)
     words, start = kernel_record(asm, args.function)
     lf = Lifter(params, words, start, kernel_body(asm, args.function))
+    tgs = re.findall(r'^(@[\w.$"]+) = [^\n]*addrspace\(3\) global', ll, re.M)
+    if len(tgs) == 1:
+      lf.tgvar = tgs[0]
     lf.lift()
     # The f32 ALU flushes denormal sources and results to zero (applegpu's
     # FloatSrc / FloatDst), except under AGX's ieee-fp32 feature; the other
@@ -1465,6 +1515,9 @@ def main():
   for l in ll.split('\n'):
     if l.startswith('target ') or l.startswith('source_filename'):
       head.append(l)
+  # The module's variables (alive2 pairs them by name with the IR's).
+  head.append('')
+  head += [l for l in ll.split('\n') if re.match(r'^@[\w.$"]+ = ', l)]
   text = '\n'.join(head + [''] + sorted(lf.decls) + ['', fn, ''])
   (open(args.output, 'w') if args.output != '-' else sys.stdout).write(text)
   return 0
