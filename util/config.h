@@ -19,6 +19,12 @@ extern bool disable_poison_input;
 
 extern bool disable_undef_input;
 
+// Give code for Apple GPUs (upstream GPU IR, AIR, AGX IR) its semantics
+// (llvm_util/gpu.h).
+extern bool gpu_semantics;
+// Print the canonical form of GPU functions (to the debug stream).
+extern bool gpu_print_canonical;
+
 extern bool tgt_is_asm;
 
 extern bool fail_if_src_is_ub;

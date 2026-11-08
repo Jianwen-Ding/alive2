@@ -4,6 +4,7 @@
 #include "cache/cache.h"
 #include "llvm_util/compare.h"
 #include "llvm_util/llvm2alive.h"
+#include "llvm_util/gpu.h"
 #include "llvm_util/llvm_optimizer.h"
 #include "llvm_util/utils.h"
 #include "smt/smt.h"
@@ -205,7 +206,10 @@ and "tgt5" will unused.
     }
   }
 
-  if (M1.get()->getTargetTriple() != M2.get()->getTargetTriple()) {
+  // Code for Apple GPUs compares across its forms (upstream, AIR, AGX).
+  if (M1.get()->getTargetTriple() != M2.get()->getTargetTriple() &&
+      !(config::gpu_semantics && llvm_util::is_gpu_module(*M1) &&
+        llvm_util::is_gpu_module(*M2))) {
     *out << "Modules have different target triples\n";
     return -1;
   }
