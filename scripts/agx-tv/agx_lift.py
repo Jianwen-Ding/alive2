@@ -466,6 +466,10 @@ class Lifter:
       e.append('%s.w = zext %s %s to i16' % (base, ty, base))
       self.uniform[half] = base + '.w'
       return
+    if bits == 16:
+      # A 16-bit argument is its one half (no i16 -> i16 cast).
+      self.uniform[half] = base
+      return
     for k in range(bits // 16):
       h = '%s.%d' % (base, k)
       e.append('%s.s = lshr %s %s, %d' % (h, ty, base, 16 * k))
