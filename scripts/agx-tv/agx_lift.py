@@ -1235,6 +1235,24 @@ class Lifter:
     if not m:
       raise LiftError('convert ' + mode)
     fk, fb, tk, tb = m.group(1), m.group(2), m.group(3), m.group(4)
+    if tk == 'f' and rnd == 'rtz':
+      # The round field (printed rtz / rte) is the direction and the mode's
+      # bit 1 the rounding, named for the usual pairs (the AGX Performance
+      # Simulator's convert, exact against the G14C over 80 forms): an
+      # integer-to-float mode with the float-to-integer field converts a
+      # float to that integer type rounding to nearest even.
+      bits = int(fb)
+      fw = s.bits if s.is_reg else 32
+      fty = {32: 'float', 16: 'half'}[fw]
+      x = self.readf(s, fw)
+      sfx = 'f%d' % fw
+      self.decl('declare %s @llvm.roundeven.%s(%s)' % (fty, sfx, fty))
+      r = self.op('call %s @llvm.roundeven.%s(%s %s)' % (fty, sfx, fty, x))
+      fn = 'llvm.fpto%si.sat.i%d.f%d' % (fk, bits, fw)
+      self.decl('declare i%d @%s(%s)' % (bits, fn, fty))
+      v = self.op('call i%d @%s(%s %s)' % (bits, fn, fty, r))
+      self.write(d, v, bits, act)
+      return
     if tk == 'f':
       if rnd != 'rte':
         raise LiftError('convert to float rounding ' + rnd)
