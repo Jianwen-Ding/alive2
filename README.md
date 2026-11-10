@@ -304,6 +304,91 @@ Please keep in mind that you do not have to compile Alive2 in order to
 try out alive-tv; it is available online: https://alive2.llvm.org/ce/
 
 
+Apple GPUs (AIR and AGX)
+------------------------
+
+alive-tv and the `tv` plugin give code for Apple GPUs its semantics
+(`llvm_util/gpu.h`), in the three forms of an LLVM with the AIR and AGX
+targets:
+
+* upstream GPU IR, what a front end hands the AIR target: LLVM intrinsics and
+  instructions, OpenCL/SPIR-V work-item builtins (`_Z13get_global_idj`, ...),
+  `barrier`, AIR's system-value functions (`air.thread_position_in_grid`),
+  CUDA's `__mulhi` / `__umulhi`;
+* AIR, as the AIR target's portable passes leave it
+  (`llc -mtriple=air -air-portable`): calls of AIR's functions (`air.sin.f32`,
+  `air.atomic.global.add.s.i32`, `air.wg.barrier`, `air.simd_shuffle_xor`,
+  ...), scalar kernel arguments in constant buffers and system values as kernel
+  parameters described by `!air.kernel`;
+* AGX IR, after the AGX backend's `agx-lower-air`
+  (`opt -mtriple=agx -passes=agx-lower-air`): `agx_kernel`s, AGX's address
+  spaces and `llvm.agx.*` intrinsics.
+
+Each form is rewritten into one canonical form before its translation, so that
+any two compare, across triples:
+
+```
+$ llc -mtriple=air -air-portable k.ll -o k.air.ll
+$ opt -mtriple=agx -passes=agx-lower-air -S k.air.ll -o k.agx.ll
+$ alive-tv k.ll k.air.ll        # upstream -> AIR
+$ alive-tv k.air.ll k.agx.ll    # AIR -> AGX
+$ alive-tv k.ll k.agx.ll        # upstream -> AGX
+```
+
+What the canonical form says:
+
+* System values are computed from twelve uninterpreted values (the thread's
+  position in its threadgroup, the threadgroup's in the grid, the threadgroup
+  and grid sizes), under the bounds every launch has (1 to 1024 threads per
+  dimension, positions below sizes): a grid position is
+  `group * size + position in group`, SIMD-groups are 32 consecutive threads
+  of the linear thread index, OpenCL's work-item functions return 0 (ids) or
+  1 (sizes) beyond three dimensions.
+* Kernels take their scalars in constant buffers, as AIR passes them; system
+  value parameters go; threadgroup buffers (AGX: the zero-sized threadgroup
+  variable of the launch's dynamic threadgroup memory) come last; calls of
+  functions the module defines are inlined.
+* AIR's functions are LLVM's: the math functions by the inverse of the AIR
+  target's `AIRIntrinsicMappings.td` (`air.fast_*` with `afn`, `air.fmin` is
+  `llvm.minnum`), atomics as `atomicrmw` / `cmpxchg` (AIR's compare-exchange
+  returns no success flag: it succeeds when it finds the expected value, as
+  the AIR target and AGX take it), `convert`, `dot`, `pack`, `fract`, `rsqrt`,
+  `mul_hi` and the rest as `agx-lower-air` defines them.
+* The memory model is alive2's, sequential: atomics are loads and stores, and
+  an ordered atomic or a fence is a call that may change any memory other
+  threads see; barriers (`air.wg.barrier`, `llvm.agx.threadgroup.barrier`) are
+  such fences around a call that keeps its place; SIMD-group shuffles,
+  ballots, reductions and scans keep their number and order (convergent).
+  Every shuffle is a read of a lane (`shuffle_xor` of `lane ^ mask`,
+  `shuffle_up` of `lane - delta` or, for the lowest lanes, the thread's own
+  value, as MSL defines them), so that AIR's shuffles, AGX's and MLIR's lane
+  arithmetic compare.
+* AIR and AGX have no floating-point environment to change: outside `strictfp`
+  functions a constrained operation that rounds to nearest and ignores
+  exceptions is the plain operation.
+* alive2 has one address space: the canonical form has none, so memories of
+  different spaces may alias there. That only keeps alive2 from proving what
+  depends on their being disjoint. `noalias` (which alive2 does not support)
+  is dropped from parameters.
+
+`-gpu-print-canonical -dbg` prints the canonical form; `-gpu-semantics=false`
+turns all this off. Not modelled: SIMD-group matrices (AIR's `<64 x T>` and
+AGX's `<2 x T>` fragments have no common form), the math functions AGX builds
+in software (`asinh`, `sinpi`, ...), AGX's recovery of software doubles, and
+`air.indirect_buffer` argument buffers. Floating point in memory makes the
+solver slow (`-smt-to`); NaN payloads differ between AIR's software forms and
+the LLVM operations AGX restores: AIR -> AGX then reports a mismatch whose
+operands are NaNs (`ieee-fp32-flag`, `recover-atomic-f64`, minimum/maximum),
+since AIR's software forms return one NaN where LLVM's operations may return
+any; upstream -> AGX, where the front end's operation allowed any NaN,
+verifies.
+
+`tests/alive-tv/gpu` has the three comparisons of real kernels and what they
+found in the AIR target: `__mulhi` computed from the unsigned product, and
+`llvm.minimum`/`maximum` lowered without ordering signed zeros in the
+portable passes (both fixed there).
+
+
 Running the Standalone LLVM Execution Tool (alive-exec)
 -------------------------------------------------------
 

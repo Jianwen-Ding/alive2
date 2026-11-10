@@ -36,6 +36,18 @@ llvm::cl::opt<bool> opt_disable_undef(LLVM_ARGS_PREFIX "disable-undef-input",
   llvm::cl::desc("Assume inputs are not undef (default=false)"),
   llvm::cl::init(false), llvm::cl::cat(alive_cmdargs));
 
+llvm::cl::opt<bool> opt_gpu_semantics(LLVM_ARGS_PREFIX "gpu-semantics",
+  llvm::cl::desc("Give code for Apple GPUs (upstream GPU IR, AIR from the AIR "
+                 "target's portable passes, AGX IR from agx-lower-air) its "
+                 "semantics, so that the three forms compare (default=true)"),
+  llvm::cl::init(true), llvm::cl::cat(alive_cmdargs));
+
+llvm::cl::opt<bool> opt_gpu_print_canonical(
+  LLVM_ARGS_PREFIX "gpu-print-canonical",
+  llvm::cl::desc("Print the canonical form of each GPU function before its "
+                 "translation (default=false)"),
+  llvm::cl::init(false), llvm::cl::cat(alive_cmdargs));
+
 llvm::cl::opt<bool> opt_disable_poison(LLVM_ARGS_PREFIX "disable-poison-input",
   llvm::cl::desc("Assume inputs are not poison (default=false)"),
   llvm::cl::init(false), llvm::cl::cat(alive_cmdargs));

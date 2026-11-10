@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Cost a kernel with the AGX Performance Simulator: compile it for AGX
+# (through the AIR target's portable passes and agx-lower-air when it is
+# AIR: --air), and print agx_cost's cycles of one SIMD-group, the code size
+# and the registers.
+#
+#   agx-perf [--air] [-mcpu=agx-g14c] kernel.ll [agx_cost launch inputs...]
+#
+# LLC, OPT, OBJCOPY name the LLVM tools (with the AIR and AGX targets),
+# AGX_COST the simulator's agx_cost. One kernel per file.
+set -euo pipefail
+LLC=${LLC:-llc}
+OPT=${OPT:-opt}
+OBJCOPY=${OBJCOPY:-llvm-objcopy}
+AGX_COST=${AGX_COST:-agx_cost}
+air=
+cpu=agx-g14c
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --air) air=1; shift ;;
+    -mcpu=*) cpu=${1#-mcpu=}; shift ;;
+    *) break ;;
+  esac
+done
+in=$1; shift
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+src=$in
+if [[ -n $air ]]; then
+  "$LLC" -mtriple=air -air-portable "$in" -o "$tmp/air.ll"
+  "$OPT" -mtriple=agx -passes=agx-lower-air -S "$tmp/air.ll" -o "$tmp/agx.ll"
+  src=$tmp/agx.ll
+fi
+"$LLC" -mtriple=agx -mcpu="$cpu" "$src" -o "$tmp/k.s"
+"$LLC" -mtriple=agx -mcpu="$cpu" -filetype=obj "$src" -o "$tmp/k.o"
+"$OBJCOPY" -O binary --only-section=.text "$tmp/k.o" "$tmp/k.bin"
+cycles=$("$AGX_COST" "$tmp/k.bin" --allow-unknown "$@" | tail -1 |
+         python3 -c 'import json,sys; print(json.load(sys.stdin)["cycles"])')
+insts=$(grep -cP '^\t(?!trap|//|\.)[a-z]' "$tmp/k.s" || true)
+gprs=$(grep -oP 'general purpose registers: \K\d+' "$tmp/k.s" | head -1)
+echo "cycles $cycles instructions $insts gprs $gprs"
+if [[ -n ${AGX_PERF_ASM:-} ]]; then cp "$tmp/k.s" "$AGX_PERF_ASM"; fi
