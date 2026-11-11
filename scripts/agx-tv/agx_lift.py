@@ -466,6 +466,10 @@ class Lifter:
       e.append('%s.w = zext %s %s to i16' % (base, ty, base))
       self.uniform[half] = base + '.w'
       return
+    if bits == 16:
+      # A 16-bit argument is its one half (no i16 -> i16 cast).
+      self.uniform[half] = base
+      return
     for k in range(bits // 16):
       h = '%s.%d' % (base, k)
       e.append('%s.s = lshr %s %s, %d' % (h, ty, base, 16 * k))
@@ -1222,36 +1226,59 @@ class Lifter:
       v = self.op('or i%d %s, %s' % (W, keep, r))
     self.write(d, self.op('trunc i%d %s to i%d' % (W, v, w)), w, act)
 
+  # The convert's modes by name: mode = size << 2 | rte << 1 | signed with
+  # size 0 / 1 / 2 for 8 / 16 / 32 bits (the AGX Performance Simulator's
+  # fsem::convert, exact against the G14C). The printed name is the usual
+  # direction of the mode; modes without a name print as their number.
+  CONVERT_MODES = {'u8_to_f': 0, 's8_to_f': 1, 'f_to_u16': 4, 'f_to_s16': 5,
+                   'u16_to_f': 6, 's16_to_f': 7, 'f_to_u32': 8, 'f_to_s32': 9,
+                   'u32_to_f': 10, 's32_to_f': 11}
+
   def convert(self, ops, act):
-    """convert MODE, D, S, ROUND: an integer source has the mode's width,
-    read from S zero-extended (sign-extended with .sx) or truncated; a float
-    source and destination are as wide as their register."""
+    """convert MODE, D, S, ROUND: ROUND (printed rtz / rte) is the direction,
+    rtz float to integer and rte integer to float; the mode gives the integer
+    width and signedness and, in its bit 1, whether the conversion rounds to
+    nearest even (toward zero otherwise). Float to integer saturates to the
+    type (NaN 0) and the result is zero-extended into the register; an
+    integer source has the mode's width, read from S zero-extended
+    (sign-extended with .sx) or truncated; a float source and destination are
+    as wide as their register."""
     mode, d, s, rnd = ops[0], Operand(ops[1]), Operand(ops[2]), ops[3]
-    m = re.match(r'^(f|s|u)(\d*)_to_(f|s|u)(\d*)$', mode)
-    if not m:
-      raise LiftError('convert ' + mode)
-    fk, fb, tk, tb = m.group(1), m.group(2), m.group(3), m.group(4)
-    if tk == 'f':
-      if rnd != 'rte':
-        raise LiftError('convert to float rounding ' + rnd)
-      bits = int(fb)
-      x = self.read(s, bits)
-      fw = d.bits
-      fty = {32: 'float', 16: 'half'}[fw]
-      v = self.op('%s i%d %s to %s' % ('sitofp' if fk == 's' else 'uitofp',
-                                       bits, x, fty))
-      self.writef(d, v, fw, act)
+    if mode in self.CONVERT_MODES:
+      m = self.CONVERT_MODES[mode]
+    elif mode.isdigit():
+      m = int(mode)
     else:
-      if rnd != 'rtz':
-        raise LiftError('convert to integer rounding ' + rnd)
-      bits = int(tb)
+      raise LiftError('convert ' + mode)
+    if (m >> 2) > 2:
+      raise LiftError('convert mode %d' % m)
+    bits = 8 << (m >> 2)
+    signed = bool(m & 1)
+    rte = bool(m & 2)
+    if rnd == 'rtz':
       fw = s.bits if s.is_reg else 32
       fty = {32: 'float', 16: 'half'}[fw]
       x = self.readf(s, fw)
-      fn = 'llvm.fpto%si.sat.i%d.f%d' % (tk, bits, fw)
+      sfx = 'f%d' % fw
+      if rte:
+        self.decl('declare %s @llvm.roundeven.%s(%s)' % (fty, sfx, fty))
+        x = self.op('call %s @llvm.roundeven.%s(%s %s)' % (fty, sfx, fty, x))
+      fn = 'llvm.fpto%si.sat.i%d.f%d' % ('s' if signed else 'u', bits, fw)
       self.decl('declare i%d @%s(%s)' % (bits, fn, fty))
       v = self.op('call i%d @%s(%s %s)' % (bits, fn, fty, x))
       self.write(d, v, bits, act)
+      return
+    if rnd != 'rte':
+      raise LiftError('convert direction ' + rnd)
+    fw = d.bits
+    # Toward zero rounds only an integer wider than the float's significand.
+    if not rte and bits > (11 if fw == 16 else 24):
+      raise LiftError('convert to float toward zero')
+    x = self.read(s, bits)
+    fty = {32: 'float', 16: 'half'}[fw]
+    v = self.op('%s i%d %s to %s' % ('sitofp' if signed else 'uitofp',
+                                     bits, x, fty))
+    self.writef(d, v, fw, act)
 
   def threadgroup_mem(self, mn, ops, act):
     """threadgroup_load / threadgroup_store FMT, MASK, R, BASE, INDEX: the
