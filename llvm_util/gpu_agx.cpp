@@ -140,7 +140,8 @@ public:
   }
 
   /// The dynamic threadgroup memory Fn uses.
-  GlobalVariable *dynamicThreadgroupMemory(Function &Fn) const override {
+  void dynamicThreadgroupMemory(
+      Function &Fn, SmallVectorImpl<GlobalVariable *> &Out) const override {
     GlobalVariable *DynTG = nullptr;
     for (GlobalVariable &G : Fn.getParent()->globals())
       if (isDynamicThreadgroupMemory(G) &&
@@ -149,7 +150,8 @@ public:
             return I && I->getFunction() == &Fn;
           }))
         DynTG = &G;
-    return DynTG;
+    if (DynTG)
+      Out.push_back(DynTG);
   }
 
   /// What AGX says about its kernels' buffers comes from the ABI.

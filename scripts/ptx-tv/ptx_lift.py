@@ -67,12 +67,19 @@ def parse_signature(ll, name):
   """(return type, calling convention, params) of @name's definition."""
   prefix, params, _ = function_header(ll, name)
   cc = 'ptx_kernel ' if re.search(r'\bptx_kernel\b', prefix) else ''
-  # The return type: the last type-looking word of the prefix.
-  words = re.sub(r'\b(ptx_kernel|ptx_device|dso_local|internal|private|'
-                 r'linkonce_odr|weak_odr|hidden|protected|default|'
-                 r'local_unnamed_addr|unnamed_addr|noundef|signext|zeroext|'
-                 r'inreg|nonnull)\b', ' ', prefix).split()
-  ret = words[-1] if words else 'void'
+  # The return type: the last type among the prefix's words (vectors,
+  # structures and arrays are one word; attributes are not types).
+  words = split_top(prefix.replace('addrspace (', 'addrspace('), ' ')
+  joined = []
+  for w in words:
+    if w.startswith('addrspace(') and joined and joined[-1] == 'ptr':
+      joined[-1] = 'ptr ' + w
+    elif w:
+      joined.append(w)
+  types = [w for w in joined if re.fullmatch(
+      r'void|i\d+|half|bfloat|float|double|fp128|x86_fp80|ptr( addrspace\(\d+\))?|'
+      r'<.*>|\{.*\}|\[.*\]|%[\w.$"]+', w)]
+  ret = types[-1] if types else 'void'
   return ret, cc, params
 
 
@@ -164,7 +171,8 @@ def statements(body):
       out.append((c,))
       i += 1
       continue
-    m = re.compile(r'([$\w.]+)\s*:').match(body, i)
+    # (Not ld.param::func, a state space's sub-qualifier.)
+    m = re.compile(r'([$\w.]+)\s*:(?!:)').match(body, i)
     if m and not body[i] == '@':
       out.append(('label', m.group(1)))
       i = m.end()
@@ -184,7 +192,9 @@ class Instr:
       self.guard = (m.group(2), m.group(1) == '!')
       text = m.group(3)
     parts = text.split(None, 1)
-    self.op = parts[0]
+    # The sub-qualifiers of the parameter and shared spaces that are the
+    # space itself here (ld.param::func, st.shared::cta).
+    self.op = re.sub(r'\.(param|shared)::(func|entry|cta)\b', r'.\1', parts[0])
     self.mods = self.op.split('.')
     self.base = self.mods[0]
     self.operands = split_top(parts[1]) if len(parts) > 1 else []
@@ -271,9 +281,11 @@ class Lifter:
                     r'(\[\d+\])?', retparam)
       if not m:
         raise LiftError('return parameter: ' + retparam)
+      # (name, bits of a scalar, or None, and bytes of an array).
       if m.group(3):
-        raise LiftError('aggregate return values are not lifted')
-      self.retparam = (m.group(2), TYPES[m.group(1)][1])
+        self.retparam = (m.group(2), None, int(m.group(3)[1:-1]))
+      else:
+        self.retparam = (m.group(2), TYPES[m.group(1)][1], None)
     self.regs = {}      # name -> bits
     self.locals = {}    # local symbol -> (space, size, align)
     self.body = []      # ('label', name) | ('instr', Instr)
@@ -583,7 +595,14 @@ class Lifter:
         out.append('  %s.init = freeze %s poison' % (self.slot(r), ty))
         out.append('  store %s %s.init, ptr %s' % (ty, self.slot(r),
                                                    self.slot(r)))
-    if self.retparam:
+    if self.retparam and self.retparam[1] is None:
+      # An array: the bytes the IR's return value is laid out in.
+      out.append('  %%retval = alloca [%d x i8], align 16' % self.retparam[2])
+    elif self.retparam and self.ret.startswith('ptr'):
+      # A returned pointer stays a pointer (its provenance with it).
+      out.append('  %retval = alloca ptr')
+      out.append('  store ptr null, ptr %retval')
+    elif self.retparam:
       out.append('  %%retval = alloca i%d' % self.retparam[1])
       out.append('  %%retval.init = freeze i%d poison' % self.retparam[1])
       out.append('  store i%d %%retval.init, ptr %%retval' %
@@ -619,6 +638,10 @@ class Lifter:
           blocks.append(cur)
           cur = ['b%d' % len(blocks), []]
     blocks.append(cur)
+    # Code after an unconditional branch or return with no label is never
+    # run: dropped (it would keep reads of registers that are no more).
+    blocks = [b for i, b in enumerate(blocks)
+              if i == 0 or not re.fullmatch(r'b\d+', b[0])]
     self.labels = {b[0]: 'L.' + b[0].replace('$', '_') for b in blocks}
     out.append('  br label %%%s' % self.labels[blocks[0][0]])
     for bi, (label, instrs) in enumerate(blocks):
@@ -635,7 +658,12 @@ class Lifter:
           self.ret_instr()
       out.extend(self.lines)
     out.append('}')
-    head = ['target triple = "nvptx64-nvidia-cuda"', '']
+    head = ['target triple = "nvptx64-nvidia-cuda"']
+    # The source's datalayout (its pointers' sizes are alive2's).
+    dl = re.search(r'^target datalayout = .*$', self.ll, re.M)
+    if dl:
+      head.append(dl.group(0))
+    head.append('')
     # The module's named types (of byval parameters, of variables).
     head += re.findall(r'^%[\w.$"]+ = type .*$', self.ll, re.M)
     for n in sorted(self.globals_used):
@@ -647,10 +675,21 @@ class Lifter:
     if self.ret == 'void':
       self.emit('ret void')
       return
-    bits = self.retparam[1] if self.retparam else None
-    if bits is None:
+    if not self.retparam:
       raise LiftError('a value returned without a return parameter')
+    bits = self.retparam[1]
+    if bits is None:
+      v = self.t()
+      self.emit('%s = load %s, ptr %%retval, align 1' % (v, self.ret))
+      self.emit('ret %s %s' % (self.ret, v))
+      return
     v = self.t()
+    if self.ret.startswith('ptr'):
+      self.emit('%s = load ptr, ptr %%retval' % v)
+      if self.ret != 'ptr':
+        v = self.cast('addrspacecast', v, 'ptr', self.ret)
+      self.emit('ret %s %s' % (self.ret, v))
+      return
     self.emit('%s = load i%d, ptr %%retval' % (v, bits))
     self.emit('ret %s %s' % (self.ret, self.to_ir(v, bits, self.ret)))
 
@@ -761,6 +800,10 @@ class Lifter:
       self.emit('fence seq_cst')
     elif x.has('acq_rel') or len(x.mods) == 2:
       self.emit('fence acq_rel')
+    elif x.has('acquire'):
+      self.emit('fence acquire')
+    elif x.has('release'):
+      self.emit('fence release')
     else:
       raise LiftError('fence not lifted: ' + str(x))
 
@@ -859,12 +902,36 @@ class Lifter:
       if m in ('v2', 'v4', 'v8'):
         n = int(m[1:])
     kind, bits = TYPES[self.itype(x)]
+    # The access's kind: plain (.weak too), volatile (as LLVM's), or atomic
+    # in an order (.relaxed: monotonic). Its scope (.cta, .gpu, .sys) is no
+    # matter in a sequential memory model.
+    self.order = None
     for m in x.mods[1:]:
-      if m in ('volatile', 'relaxed', 'acquire', 'release', 'weak', 'cta',
-               'gpu', 'sys', 'cluster', 'mmio'):
-        if m not in ('weak',):
-          raise LiftError('ordered or volatile access not lifted: ' + str(x))
+      if m == 'volatile':
+        self.order = 'volatile'
+      elif m in ('relaxed', 'acquire', 'release'):
+        self.order = {'relaxed': 'monotonic'}.get(m, m)
+      elif m == 'mmio':
+        raise LiftError('mmio access not lifted: ' + str(x))
+    if self.order and self.order != 'volatile' and n > 1:
+      raise LiftError('vector atomic access not lifted: ' + str(x))
     return space, n, kind, bits
+
+  def load_text(self, ty, a, align):
+    if self.order == 'volatile':
+      return 'load volatile %s, ptr %s, align %d' % (ty, a, align)
+    if self.order:
+      return 'load atomic %s, ptr %s %s, align %d' % (ty, a, self.order,
+                                                       align)
+    return 'load %s, ptr %s, align %d' % (ty, a, align)
+
+  def store_text(self, ty, v, a, align):
+    if self.order == 'volatile':
+      return 'store volatile %s %s, ptr %s, align %d' % (ty, v, a, align)
+    if self.order:
+      return 'store atomic %s %s, ptr %s %s, align %d' % (ty, v, a,
+                                                          self.order, align)
+    return 'store %s %s, ptr %s, align %d' % (ty, v, a, align)
 
   def elems(self, tok, n):
     if n == 1:
@@ -885,11 +952,11 @@ class Lifter:
       al = align if i == 0 else bits // 8
       if d in self.ptr and bits == 64:
         v = self.t('ld')
-        self.emit('%s = load ptr, ptr %s, align %d' % (v, a, al))
+        self.emit('%s = %s' % (v, self.load_text('ptr', a, al)))
         self.write_reg(d, self.freeze(v, 'ptr'), 'ptr')
         continue
       v = self.t('ld')
-      self.emit('%s = load i%d, ptr %s, align %d' % (v, bits, a, al))
+      self.emit('%s = %s' % (v, self.load_text('i%d' % bits, a, al)))
       v = self.freeze(v, 'i%d' % bits)
       if d == '_':
         continue
@@ -943,7 +1010,7 @@ class Lifter:
       v, w = self.cast('ptrtoint', v, 'ptr', 'i64'), 64
     elif t in ('float', 'double', 'half', 'bfloat'):
       w = {'float': 32, 'double': 64, 'half': 16, 'bfloat': 16}[t]
-      v = self.cast('bitcast', P.name, t, 'i%d' % w)
+      v = self.cast('bitcast', self.freeze(P.name, t), t, 'i%d' % w)
     elif re.fullmatch(r'i\d+', t):
       w = int(t[1:])
       v = P.name
@@ -954,7 +1021,9 @@ class Lifter:
       eb = {'float': 32, 'double': 64, 'half': 16, 'bfloat': 16}.get(
           m.group(2)) or int(m.group(2)[1:])
       w = int(m.group(1)) * eb
-      v = self.cast('bitcast', P.name, t, 'i%d' % w)
+      # Each element frozen (a poison element is some value there), not the
+      # whole: a bitcast of a vector with a poison element is all poison.
+      v = self.cast('bitcast', self.freeze(P.name, t), t, 'i%d' % w)
     v = self.freeze(v, 'i%d' % w)
     if off:
       s = self.t()
@@ -974,17 +1043,33 @@ class Lifter:
       a = self.gep(p, str(i * bits // 8))
       al = align if i == 0 else bits // 8
       if s in self.ptr and bits == 64:
-        self.emit('store ptr %s, ptr %s, align %d' % (self.read_reg(s), a, al))
+        self.emit(self.store_text('ptr', self.read_reg(s), a, al))
         continue
       v = self.operand(s, bits)
-      self.emit('store i%d %s, ptr %s, align %d' % (bits, v, a, al))
+      self.emit(self.store_text('i%d' % bits, v, a, al))
 
   def st_param(self, x, n, bits):
     m = re.fullmatch(r'\[\s*([\w$]+)\s*(?:\+\s*(\d+))?\s*\]',
                      x.operands[0].strip())
-    if (not m or not self.retparam or m.group(1) != self.retparam[0] or
-        m.group(2) or n != 1):
+    if not m or not self.retparam or m.group(1) != self.retparam[0]:
       raise LiftError('parameter store not lifted: ' + str(x))
+    if self.retparam[1] is None:
+      # Into the return value's bytes, at its offset.
+      off = int(m.group(2) or 0)
+      for i, s in enumerate(self.elems(x.operands[1], n)):
+        a = self.gep('%retval', str(off + i * bits // 8))
+        self.emit('store i%d %s, ptr %s, align 1' %
+                  (bits, self.operand(s, bits), a))
+      return
+    if m.group(2) or n != 1:
+      raise LiftError('parameter store not lifted: ' + str(x))
+    if self.ret.startswith('ptr'):
+      p = self.pointer(x.operands[1])
+      if p is None:
+        p = self.cast('inttoptr', self.operand(x.operands[1], 64), 'i64',
+                      'ptr')
+      self.emit('store ptr %s, ptr %%retval' % p)
+      return
     rb = self.retparam[1]
     v = self.operand(x.operands[1], bits)
     self.emit('store i%d %s, ptr %%retval' % (rb, self.resize(v, bits, rb,

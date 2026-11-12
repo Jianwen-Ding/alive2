@@ -131,6 +131,32 @@ public:
     return Fn.getCallingConv() == CallingConv::PTX_Kernel;
   }
 
+  /// Dynamic shared memory: every external zero-sized array of the shared
+  /// space starts where the launch's dynamic shared memory does (CUDA's
+  /// `extern __shared__ T a[]`), so all of them are one object.
+  void dynamicThreadgroupMemory(
+      Function &Fn, SmallVectorImpl<GlobalVariable *> &Out) const override {
+    for (GlobalVariable &G : Fn.getParent()->globals()) {
+      auto *AT = dyn_cast<ArrayType>(G.getValueType());
+      if (G.getAddressSpace() != ThreadgroupAS || !G.isDeclaration() || !AT ||
+          AT->getNumElements() != 0)
+        continue;
+      for (User *U : G.users()) {
+        auto *I = dyn_cast<Instruction>(U);
+        auto *CE = dyn_cast<ConstantExpr>(U);
+        bool Used = I && I->getFunction() == &Fn;
+        if (CE)
+          for (User *CU : CE->users())
+            if (auto *CI = dyn_cast<Instruction>(CU))
+              Used |= CI->getFunction() == &Fn;
+        if (Used) {
+          Out.push_back(&G);
+          break;
+        }
+      }
+    }
+  }
+
   /// PTX passes a kernel's values in the parameter space, as LLVM IR does.
   bool scalarsInConstantBuffers() const override { return false; }
 

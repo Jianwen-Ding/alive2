@@ -242,7 +242,9 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
     }
 
     // The dynamic threadgroup memory F uses (AGX's).
-    GlobalVariable *DynTG = Target.dynamicThreadgroupMemory(*Src);
+    SmallVector<GlobalVariable *, 2> DynTGs;
+    Target.dynamicThreadgroupMemory(*Src, DynTGs);
+    GlobalVariable *DynTG = DynTGs.empty() ? nullptr : DynTGs[0];
 
     // Parameters: the others in order, then the threadgroup buffers. A
     // kernel of a target that says so takes a value as AIR passes it, in a
@@ -285,8 +287,12 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
       VMap[A] = NewF->getArg(I++);
     for (Argument *A : Trailing)
       VMap[A] = NewF->getArg(I++);
-    if (DynTG)
-      VMap[DynTG] = NewF->getArg(I++);
+    if (DynTG) {
+      // Each variable that stands for it is the one object.
+      for (GlobalVariable *G : DynTGs)
+        VMap[G] = NewF->getArg(I);
+      ++I;
+    }
     // The entry: the system values, then F's body.
     BasicBlock *Pre = BasicBlock::Create(Ctx, "entry.gpu", NewF);
     IRBuilder<> B(Pre);

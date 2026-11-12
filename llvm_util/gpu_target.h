@@ -367,11 +367,11 @@ public:
   /// parameter in a constant buffer (a pointer to it), as AIR passes it.
   virtual bool scalarsInConstantBuffers() const { return true; }
 
-  /// The variable that stands for the launch's dynamic threadgroup memory,
-  /// if Fn uses one (it becomes a trailing parameter).
-  virtual GlobalVariable *dynamicThreadgroupMemory(Function &Fn) const {
-    return nullptr;
-  }
+  /// The variables that stand for the launch's dynamic threadgroup memory
+  /// and that Fn uses: one object, which becomes a trailing parameter.
+  virtual void
+  dynamicThreadgroupMemory(Function &Fn,
+                           SmallVectorImpl<GlobalVariable *> &Out) const {}
 
   /// Drop from the canonical function NewF of F the parameter attributes
   /// that come from the target's ABI, which the canonical form does not
