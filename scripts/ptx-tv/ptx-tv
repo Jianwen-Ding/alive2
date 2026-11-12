@@ -42,10 +42,11 @@ in=$1; shift
 dir=${keep:-$(mktemp -d)}
 mkdir -p "$dir"
 # The source as opt reads it (auto-upgraded intrinsics, the target's
-# datalayout), without passes; without !tbaa, which alive2 does not
-# translate (dropping it only drops assumptions).
+# datalayout), without passes; without the instruction metadata alive2 does
+# not translate (!tbaa, !invariant.load, alias scopes, ...: dropping it only
+# drops assumptions).
 "$OPT" -mtriple=nvptx64-nvidia-cuda -passes=verify -S "$in" |
-  sed -E 's/, !tbaa(\.struct)? ![0-9]+//g' > "$dir/src.ll"
+  sed -E 's/, !(tbaa|tbaa\.struct|invariant\.load|alias\.scope|noalias|nontemporal|mem\.cache_hint|atomic\.[a-z.]*|[a-z.]*nvvm[a-z.]*) ![0-9]+//g' > "$dir/src.ll"
 if [[ -n $ptx ]]; then
   cp "$ptx" "$dir/out.ptx"
 else

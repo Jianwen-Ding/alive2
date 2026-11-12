@@ -366,6 +366,7 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
     lowerCalls(*NewF);
     defaultFPEnvironment(*NewF);
     sequentialMemory(*NewF);
+    mergeFences(*NewF);
     if (config::gpu_print_canonical) {
       config::dbg() << "\n----------------------------------------\n"
                                "GPU canonical form of " << Out.orig_name
@@ -503,6 +504,10 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
           fence(B);
         I->eraseFromParent();
       } else if (auto *L = dyn_cast<LoadInst>(I)) {
+        // An acquire load is the load, then what other threads did; a
+        // sequentially consistent one is also after what they did.
+        if (L->getOrdering() == AtomicOrdering::SequentiallyConsistent)
+          fence(B);
         if (ordered(L->getOrdering()))
           after();
         L->setAtomic(AtomicOrdering::NotAtomic);
@@ -510,6 +515,8 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
       } else if (auto *S = dyn_cast<StoreInst>(I)) {
         if (ordered(S->getOrdering()))
           fence(B);
+        if (S->getOrdering() == AtomicOrdering::SequentiallyConsistent)
+          after();
         S->setAtomic(AtomicOrdering::NotAtomic);
         S->setVolatile(false);
       } else if (auto *RMW = dyn_cast<AtomicRMWInst>(I)) {
@@ -521,6 +528,29 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
         RMW->eraseFromParent();
       } else if (auto *X = dyn_cast<AtomicCmpXchgInst>(I)) {
         sequentialCmpXchg(*X);
+      }
+    }
+  }
+
+  /// Fences with no access of memory between them are one: what other
+  /// threads may do at the first, they may at the second.
+  void mergeFences(Function &Fn) {
+    Function *Fence = M.getFunction("alive.gpu.fence");
+    if (!Fence)
+      return;
+    for (BasicBlock &BB : Fn) {
+      CallInst *Last = nullptr;
+      for (Instruction &I : make_early_inc_range(BB)) {
+        auto *CI = dyn_cast<CallInst>(&I);
+        if (CI && CI->getCalledFunction() == Fence) {
+          if (Last) {
+            CI->eraseFromParent();
+            continue;
+          }
+          Last = CI;
+        } else if (I.mayReadOrWriteMemory() || I.isTerminator()) {
+          Last = nullptr;
+        }
       }
     }
   }

@@ -39,7 +39,9 @@ expect correct "guarded verifies" --keep "$tmp/guarded" "$here/guarded.ll"
 expect correct "shared verifies" --keep "$tmp/shared" "$here/shared.ll"
 expect correct "vec verifies" --keep "$tmp/vec" "$here/vec.ll"
 expect correct "bits verifies" --keep "$tmp/bits" "$here/bits.ll"
-expect correct "float verifies" --keep "$tmp/float" "$here/float.ll"
+# Floats in memory are slow for the solver.
+expect correct "float verifies" --keep "$tmp/float" "$here/float.ll" \
+  -smt-to=300000
 expect correct "intrinsics verify" --keep "$tmp/intrinsics" \
   "$here/intrinsics.ll"
 # alive2 checks loops unrolled to a bound.

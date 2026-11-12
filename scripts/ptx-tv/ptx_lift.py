@@ -578,12 +578,26 @@ class Lifter:
 
   # -- The function ---------------------------------------------------------
 
+  def float_registers(self):
+    """Registers some float instruction reads: their loads are of whole
+    words (a float that is partly poison is rare, and bytes of floats are
+    slow for the solver)."""
+    out = set()
+    for kind, x in self.body:
+      if kind != 'instr':
+        continue
+      if any(m in ('f16', 'bf16', 'f32', 'f64') for m in x.mods[1:]):
+        for o in x.operands[1:]:
+          out.update(re.findall(r'%[\w$]+', o))
+    return out
+
   def lift(self):
     self.ptr = self.analyze_pointers()
+    self.fregs = self.float_registers()
     out = []
     params = ', '.join(lifted_param(p) for p in self.params)
-    out.append('define %s%s @%s(%s) {' % (self.cc, self.ret, self.name,
-                                          params))
+    out.append('define %s%s @%s(%s)%s {' % (self.cc, self.ret, self.name,
+                                          params, self.fp_env()))
     out.append('entry:')
     # Registers start as unknown values.
     for r, bits in sorted(self.regs.items()):
@@ -670,6 +684,23 @@ class Lifter:
       head.append(self.globals[n][0])
     head.append('')
     return '\n'.join(head + out + [''] + sorted(self.decls.values())) + '\n'
+
+  def fp_env(self):
+    """The source function's floating-point environment attributes (its
+    denormal mode), which the lifted function declares too."""
+    m = re.search(r'^define[^\n]*@"?%s"?\(.*$' % re.escape(self.name), self.ll,
+                  re.M)
+    tail = m.group(0)[m.group(0).rindex(')'):] if m else ''
+    texts = [tail]
+    for g in re.findall(r'#(\d+)', tail):
+      a = re.search(r'^attributes #%s = \{(.*)\}' % g, self.ll, re.M)
+      if a:
+        texts.append(a.group(1))
+    out = []
+    for t in texts:
+      out += re.findall(r'denormal_fpenv\([^)]*\)', t)
+      out += re.findall(r'"denormal-fp-math(?:-f32)?"="[^"]*"', t)
+    return ''.join(' ' + a for a in dict.fromkeys(out))
 
   def ret_instr(self):
     if self.ret == 'void':
@@ -956,8 +987,19 @@ class Lifter:
         self.write_reg(d, self.freeze(v, 'ptr'), 'ptr')
         continue
       v = self.t('ld')
-      self.emit('%s = %s' % (v, self.load_text('i%d' % bits, a, al)))
-      v = self.freeze(v, 'i%d' % bits)
+      if bits > 8 and not self.order and d not in self.fregs:
+        # Memory holds bytes: a byte that is poison in the IR is some value
+        # in memory, and the others are what they are (an integer load of a
+        # poison byte would be all poison).
+        vt = '<%d x i8>' % (bits // 8)
+        self.emit('%s = %s' % (v, self.load_text(vt, a, al)))
+        v = self.cast('bitcast', self.freeze(v, vt), vt, 'i%d' % bits)
+      else:
+        self.emit('%s = %s' % (v, self.load_text('i%d' % bits, a, al)))
+        v = self.freeze(v, 'i%d' % bits)
+        if self.order in ('monotonic', 'volatile') and space != 'const':
+          # The bits read are in memory: a later read sees them too.
+          self.emit('store i%d %s, ptr %s, align %d' % (bits, v, a, al))
       if d == '_':
         continue
       rb = self.reg(d)
@@ -1087,7 +1129,7 @@ class Lifter:
       elif m in ('add', 'min', 'max', 'inc', 'dec', 'and', 'or', 'xor',
                  'exch', 'cas'):
         op = m
-      elif m in ('cta', 'gpu', 'sys', 'cluster') or m in TYPES:
+      elif m in ('cta', 'gpu', 'sys', 'cluster', 'noftz') or m in TYPES:
         pass
       else:
         raise LiftError('atomic modifier .%s not lifted: %s' % (m, x))
@@ -1095,37 +1137,94 @@ class Lifter:
     ops = x.operands if red else x.operands[1:]
     p = self.address(ops[0])
     T = 'i%d' % bits
+    # The operation as the GPU does it, between fences if it is ordered: it
+    # reads the location's bits (each byte frozen: memory holds bits, and a
+    # byte that is poison in the IR is some value there), and writes what
+    # the operation makes of them (a CAS that fails writes back what it read:
+    # no matter in a sequential model, and two reads then agree).
+    ordered = order != 'monotonic'
+    if ordered:
+      self.emit('fence acq_rel')
+    old = self.read_bits(p, bits)
     if kind in ('f', 'bf'):
       if op not in ('add', 'min', 'max'):
         raise LiftError('atomic not lifted: ' + str(x))
       ft = FLOAT_TYPE[(kind, bits)]
-      v = self.fval(ops[1], bits, ft)
-      rmw = {'add': 'fadd', 'min': 'fmin', 'max': 'fmax'}[op]
+      v = self.operand(ops[1], bits)
+      # atom.add.f32 "flushes subnormal inputs and results to
+      # sign-preserving zero" (PTX ISA, atom); .noftz and f64 do not.
+      ftz = op == 'add' and bits == 32 and not x.has('noftz')
+      a, b = (self.flush32(old), self.flush32(v)) if ftz else (old, v)
+      fa, fb = self.fp(a, bits, ft), self.fp(b, bits, ft)
       r = self.t()
-      self.emit('%s = atomicrmw %s ptr %s, %s %s %s, align %d' %
-                (r, rmw, p, ft, v, order, bits // 8))
-      r = self.unfp(r, ft, bits)
+      if op == 'add':
+        self.emit('%s = fadd %s %s, %s' % (r, ft, fa, fb))
+      else:
+        r = self.intr({'min': 'minnum', 'max': 'maxnum'}[op], ft,
+                      [(ft, fa), (ft, fb)])
+      new = self.unfp(r, ft, bits)
+      if ftz:
+        new = self.flush32(new)
     elif op == 'cas':
       c = self.operand(ops[1], bits)
       v = self.operand(ops[2], bits)
-      fail = {'acq_rel': 'acquire', 'release': 'monotonic'}.get(order, order)
-      pr, r = self.t(), self.t()
-      self.emit('%s = cmpxchg ptr %s, %s %s, %s %s %s %s, align %d' %
-                (pr, p, T, c, T, v, order, fail, bits // 8))
-      self.emit('%s = extractvalue { %s, i1 } %s, 0' % (r, T, pr))
+      eq, new = self.t(), self.t()
+      self.emit('%s = icmp eq %s %s, %s' % (eq, T, old, c))
+      self.emit('%s = select i1 %s, %s %s, %s %s' % (new, eq, T, v, T, old))
     else:
-      rmw = {'add': 'add', 'and': 'and', 'or': 'or', 'xor': 'xor',
-             'exch': 'xchg', 'inc': 'uinc_wrap', 'dec': 'udec_wrap',
-             'min': 'min' if kind == 's' else 'umin',
-             'max': 'max' if kind == 's' else 'umax'}.get(op)
-      if rmw is None:
-        raise LiftError('atomic not lifted: ' + str(x))
       v = self.operand(ops[1], bits)
-      r = self.t()
-      self.emit('%s = atomicrmw %s ptr %s, %s %s %s, align %d' %
-                (r, rmw, p, T, v, order, bits // 8))
+      new = self.t()
+      if op in ('add', 'and', 'or', 'xor'):
+        self.emit('%s = %s %s %s, %s' % (new, op, T, old, v))
+      elif op == 'exch':
+        new = v
+      elif op in ('min', 'max'):
+        new = self.intr(('s' if kind == 's' else 'u') + op, T,
+                        [(T, old), (T, v)])
+      elif op == 'inc':
+        # (old >= b) ? 0 : old + 1, unsigned.
+        ge, inc = self.t(), self.t()
+        self.emit('%s = icmp uge %s %s, %s' % (ge, T, old, v))
+        self.emit('%s = add %s %s, 1' % (inc, T, old))
+        self.emit('%s = select i1 %s, %s 0, %s %s' % (new, ge, T, T, inc))
+      elif op == 'dec':
+        # (old == 0 || old > b) ? b : old - 1, unsigned.
+        z, gt, o, dec = self.t(), self.t(), self.t(), self.t()
+        self.emit('%s = icmp eq %s %s, 0' % (z, T, old))
+        self.emit('%s = icmp ugt %s %s, %s' % (gt, T, old, v))
+        self.emit('%s = or i1 %s, %s' % (o, z, gt))
+        self.emit('%s = sub %s %s, 1' % (dec, T, old))
+        self.emit('%s = select i1 %s, %s %s, %s %s' % (new, o, T, v, T, dec))
+      else:
+        raise LiftError('atomic not lifted: ' + str(x))
+    self.emit('store %s %s, ptr %s, align %d' % (T, new, p, bits // 8))
+    if ordered:
+      self.emit('fence acq_rel')
     if not red:
-      self.write_reg(x.operands[0], self.freeze(r, T), T)
+      self.write_reg(x.operands[0], old, T)
+
+  def read_bits(self, p, bits):
+    """The bits at p, each byte frozen."""
+    v = self.t('ld')
+    if bits == 8:
+      self.emit('%s = load i8, ptr %s, align 1' % (v, p))
+      return self.freeze(v, 'i8')
+    vt = '<%d x i8>' % (bits // 8)
+    self.emit('%s = load %s, ptr %s, align %d' % (v, vt, p, bits // 8))
+    return self.cast('bitcast', self.freeze(v, vt), vt, 'i%d' % bits)
+
+  def flush32(self, v):
+    """An f32's bits with a subnormal flushed to zero of its sign."""
+    e, m, sub, sign, r = self.t(), self.t(), self.t(), self.t(), self.t()
+    self.emit('%s = and i32 %s, 2139095040' % (e, v))
+    self.emit('%s = and i32 %s, 8388607' % (m, v))
+    z, nz = self.t(), self.t()
+    self.emit('%s = icmp eq i32 %s, 0' % (z, e))
+    self.emit('%s = icmp ne i32 %s, 0' % (nz, m))
+    self.emit('%s = and i1 %s, %s' % (sub, z, nz))
+    self.emit('%s = and i32 %s, -2147483648' % (sign, v))
+    self.emit('%s = select i1 %s, i32 %s, i32 %s' % (r, sub, sign, v))
+    return r
 
   def i_atom(self, x):
     self.atomic(x, False)
