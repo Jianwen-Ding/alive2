@@ -388,6 +388,43 @@ found in the AIR target: `__mulhi` computed from the unsigned product, and
 `llvm.minimum`/`maximum` lowered without ordering signed zeros in the
 portable passes (both fixed there).
 
+The GPU semantics is one canonical form and one module per target
+(`llvm_util/gpu_target.h`): `gpu.cpp` holds what every target shares (system
+values and their launch bounds, barriers, fences, SIMD-group functions, the
+flat address space and the sequential memory model), and each target says
+how its code expresses them: `gpu_upstream.cpp` (OpenCL / SPIR-V builtins),
+`gpu_air.cpp`, `gpu_agx.cpp` and `gpu_nvptx.cpp`. A new GPU target is a
+`GPUTarget`: which modules and kernels are its, how its kernels take their
+parameters, and what its intrinsics mean in the builder's primitives.
+
+
+NVIDIA GPUs (NVPTX and PTX)
+---------------------------
+
+NVPTX IR (`-mtriple=nvptx64-nvidia-cuda`) is a form of the same semantics:
+`ptx_kernel`s, address spaces global 1, shared 3, const 4 and local 5 (all
+one in the canonical form), the special registers
+`llvm.nvvm.read.ptx.sreg.{tid,ntid,ctaid,nctaid}.{x,y,z}` as the thread's
+position in its CTA, the CTA's size, its position in the grid and the grid's
+size (`laneid` and `warpsize`: a warp is 32 consecutive threads),
+`barrier0` / `barrier.cta.sync*.all` as the barrier and `membar` / `fence`
+as fences. PTX passes a kernel's scalars in the parameter space, so they
+stay scalars.
+
+`scripts/ptx-tv` validates the NVPTX backend the way arm-tv validates
+AArch64: it compiles each function with `llc`, lifts the PTX back to LLVM IR
+and asks alive-tv whether the PTX refines the IR:
+
+```
+$ LLC=llc OPT=opt ALIVE_TV=alive-tv scripts/ptx-tv/ptx-tv kernel.ll
+$ scripts/ptx-tv/ptx-tv --keep dir --ptx edited.ptx --func k kernel.ll
+```
+
+The meaning of PTX's instructions is a formalization of the PTX ISA,
+`scripts/ptx-tv/ptx.formal`: one declarative entry per instruction family,
+in SMT-LIB's bit-vector and float words, that the lifter interprets
+(`ptx_formal.py`). See `scripts/ptx-tv/README.md`.
+
 
 Running the Standalone LLVM Execution Tool (alive-exec)
 -------------------------------------------------------

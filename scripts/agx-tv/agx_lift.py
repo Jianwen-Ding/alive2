@@ -28,42 +28,19 @@ of what the hardware does.
 """
 
 import argparse
+import os
 import re
 import struct
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                '..', 'gpu-tv'))
+# The lifters' common part: reading the source's headers and parameters.
+from gpu_lift import (LiftError, Param, function_header,  # noqa: E402
+                      one_line_headers, split_top, without_captures)
+
 # ---------------------------------------------------------------------------
 # The input IR: the kernel's signature.
-
-
-def split_top(s, sep=','):
-  """Split s at sep outside of parentheses, brackets and braces."""
-  out, depth, cur = [], 0, ''
-  for c in s:
-    if c in '([{<':
-      depth += 1
-    elif c in ')]}>':
-      depth -= 1
-    if c == sep and depth == 0:
-      out.append(cur)
-      cur = ''
-    else:
-      cur += c
-  if cur.strip():
-    out.append(cur)
-  return [x.strip() for x in out]
-
-
-class Param:
-  def __init__(self, text):
-    self.text = text
-    m = re.match(r'(ptr(?: addrspace\(\d+\))?|<[^>]*>|\[[^\]]*\]|\S+)', text)
-    self.type = m.group(1)
-    self.name = text.split()[-1]
-    if not self.name.startswith('%'):
-      raise LiftError('parameter without a name: ' + text)
-    b = re.search(r'byref\(([^)]*)\)', text)
-    self.byref = b.group(1) if b else None
 
 
 # The launch contract of the lifted kernel: device buffer arguments are
@@ -82,39 +59,15 @@ def lifted_param(p, align):
   (the lifted code takes pointer arguments' addresses apart, which they
   would make poison; dropping them only weakens the target's assumptions),
   and a device pointer with the contract's alignment."""
-  t = re.sub(r'\s*\b(captures\([^)]*\)|nocapture)', '', p.text)
+  t = without_captures(p.text)
   if (not align or p.type != 'ptr addrspace(1)' or p.byref or
       re.search(r'\balign \d+', t)):
     return t
   return t.replace(p.type, '%s align %d' % (p.type, BUFFER_ALIGN), 1)
 
 
-def one_line_headers(ll):
-  """The module with each function definition's header on one line."""
-  out, lines, i = [], ll.split('\n'), 0
-  while i < len(lines):
-    l = lines[i]
-    if l.startswith('define ') and '{' not in l:
-      while i + 1 < len(lines) and '{' not in l:
-        i += 1
-        l = l.rstrip() + ' ' + lines[i].strip()
-    out.append(l)
-    i += 1
-  return '\n'.join(out)
-
-
 def parse_signature(ll, name):
-  m = re.search(r'^define\s+(.*?)@' + re.escape(name) + r'\(', ll, re.M)
-  if not m:
-    raise LiftError('no definition of @' + name)
-  i, depth = m.end(), 1
-  while depth:
-    depth += {'(': 1, ')': -1}.get(ll[i], 0)
-    i += 1
-  params_text = ll[m.end():i - 1]
-  suffix = ll[i:ll.index('{', i)]
-  params = [Param(p) for p in split_top(params_text)] if params_text.strip() else []
-  return m.group(1), params, suffix
+  return function_header(ll, name)
 
 
 def float_flushes(env):
@@ -173,10 +126,6 @@ def flushing_source(ll):
 
 # ---------------------------------------------------------------------------
 # The assembly.
-
-
-class LiftError(Exception):
-  pass
 
 
 def kernel_body(asm, name):

@@ -3,7 +3,7 @@
 // Copyright (c) 2018-present The Alive2 Authors.
 // Distributed under the MIT license that can be found in the LICENSE file.
 
-// The semantics of code for Apple GPUs, in three forms:
+// The semantics of GPU code, in the forms of four targets (gpu_target.h):
 //
 //  * upstream GPU IR: what a front end hands the AIR target (LLVM IR with
 //    OpenCL/SPIR-V work-item builtins, AIR system-value calls, atomicrmw,
@@ -12,11 +12,15 @@
 //    (llc -mtriple=air -air-portable): calls of AIR's functions (air.*) and
 //    kernels whose system values are parameters described by !air.kernel;
 //  * AGX IR: the module after the AGX backend's agx-lower-air (triple agx):
-//    AGX's address spaces, agx_kernel kernels and llvm.agx.* intrinsics.
+//    AGX's address spaces, agx_kernel kernels and llvm.agx.* intrinsics;
+//  * NVPTX IR (triple nvptx64-nvidia-cuda): ptx_kernel kernels, NVPTX's
+//    address spaces and llvm.nvvm.* intrinsics (special registers, barriers,
+//    fences); PTX is lifted to it by scripts/ptx-tv.
 //
 // Each form is translated into one canonical LLVM IR form, which alive2's
 // translation from LLVM IR then gives a meaning, so that any two of the forms
-// can be compared (upstream -> AIR, AIR -> AGX, upstream -> AGX):
+// can be compared (upstream -> AIR, AIR -> AGX, upstream -> AGX, NVPTX ->
+// lifted PTX):
 //
 //  * there are no address spaces (alive2 has one): pointers of AIR's (thread
 //    0, device 1, constant 2, threadgroup 3) and AGX's (private 5, constant
@@ -52,7 +56,11 @@ class Module;
 
 namespace llvm_util {
 
-/// Whether M is code for Apple GPUs in one of the three forms above.
+namespace gpu {
+struct GPUBuilder;
+}
+
+/// Whether M is GPU code in one of the forms above.
 bool is_gpu_module(const llvm::Module &M);
 
 /// The canonical form of F, as a function of F's module (with F's name, while
@@ -75,6 +83,7 @@ private:
   // Global values created for the canonical form.
   std::vector<llvm::GlobalValue *> created;
   friend struct GPUCanonicalizer;
+  friend struct gpu::GPUBuilder;
 };
 
 }

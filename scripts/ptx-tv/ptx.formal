@@ -1,0 +1,326 @@
+; The semantics of PTX instructions, per thread, after NVIDIA's PTX ISA
+; ("Parallel Thread Execution ISA", chapter "Instruction Set"): what
+; ptx_lift.py makes of the arithmetic, logic, comparison and conversion
+; instructions. The lifter keeps the machine (registers, the parameter
+; space, memory, control flow, pointers) and reads each other instruction's
+; meaning from here, so that this file is the whole account of what they
+; compute, readable next to the ISA and independent of the NVPTX backend's
+; patterns.
+;
+; An entry:
+;
+;   (instruction PATTERN OPERANDS BODY)
+;
+; PATTERN matches the opcode's parts (add.s32: add, s32), in order:
+;   name          that part;
+;   $T:class      a type of the class, bound to T (int, sint, uint, bits,
+;                 bitsp (with pred), float, int32+ ...: see ptx_formal.py);
+;   (opt m)       an optional part m, (has m) in the body;
+;   (one N a b)   one of a, b, ..., bound to N, (is N a) in the body.
+; The first entry that matches all of the opcode's parts gives its meaning;
+; an instruction no entry matches is not lifted (its modifiers, .ftz or
+; .sat say, are not modeled).
+;
+; OPERANDS name the operands, the destination first; NAME:T reads the
+; operand as a value of type variable T (default: the pattern's first),
+; NAME:32 as 32 bits, NAME:pred as a predicate. A register wider than its
+; type is truncated (the ISA's relaxed rule for sources), a narrower one
+; extended by the type's signedness.
+;
+;   (define (NAME PARAM ...) EXPR) names an expression (a macro: its
+; parameters are substituted).
+;
+; BODY is (set DEST EXPR), or (let ((NAME EXPR) ...) BODY). EXPR is over
+; bit-vectors,
+; in SMT-LIB's words where it has them:
+;   bvadd bvsub bvmul bvand bvor bvxor bvnot bvneg bvshl bvlshr bvashr
+;   bvult bvule bvugt bvuge bvslt bvsle bvsgt bvsge = distinct   (-> 1 bit)
+;   (ite C X Y), (zext X N), (sext X N), (trunc X N), (extract HI LO X),
+;   (concat HI LO), (zext-or-trunc X N), (ext X N): extension by T's
+;   signedness, (ext-by V X N): by type variable V's (or truncation),
+;   (udiv X Y) (sdiv X Y) (urem X Y) (srem X Y): Y not 0 (nor -1 with the
+;     least X for sdiv / srem): guard them,
+;   umin umax smin smax abs popcount clz bitreverse fshl fshr,
+;   (any N): some N-bit value (what the ISA leaves unspecified);
+;   statically: (case N (a EXPR) (b EXPR) ...) by what (one N ...) matched,
+;   (if-signed X Y) by T's signedness, (has m);
+; and floats, the bits of an IEEE binary16/32/64 by width (bf16: (as-bf16)):
+;   (fp.add X Y) fp.sub fp.mul fp.div (fp.fma X Y Z) fp.sqrt fp.neg fp.abs
+;   fp.minnum fp.maxnum (fp.copysign MAG SIGN) fp.roundeven fp.trunc
+;   fp.floor fp.ceil, each rounding to nearest even;
+;   (fp.contract OP X Y): OP, which ptxas may fuse with a neighbouring
+;     operation (add, sub and mul without a rounding modifier);
+;   (fcmp PRED X Y) with LLVM's predicates (oeq une ord uno ...);
+;   (fp.convert X N): to the N-bit format, rounding to nearest even;
+;   (fp.extend X N) (fp.narrow X N): to the wider (exactly) or narrower
+;     (rounding to nearest even) N-bit format;
+;   (fp.from-sint X N) (fp.from-uint X N): integer to N-bit float, rounding
+;     to nearest even; (fp.to-int-sat V X): toward zero to the integer type
+;     V, saturating, NaN to 0;
+;   (uninterpreted "NAME" X ...): a call of function NAME, equal only to
+;     itself (the .approx instructions, as the NVVM intrinsics of the same
+;     meaning).
+; Integer literals take the width of the other operands; W is T's width
+; (WD and WS for cvt's destination and source types), and widths may be
+; sums and products of these.
+
+; ---------------------------------------------------------------------------
+; Helpers.
+
+; The n lowest bits (n at most W).
+(define (mask n) (ite (bvuge n W) (bvnot 0) (bvsub (bvshl 1 n) 1)))
+
+; Byte i of prmt's result from {b, a} (ab) and the selector c.
+(define (prmt-byte ab c i)
+  (let ((s (bvand (bvlshr c (* 4 i)) 15))
+        (byte (trunc (bvlshr ab (zext (bvmul (bvand s 7) 8) 64)) 8)))
+    (ite (= (bvand s 8) 0) byte (bvashr byte 7))))
+
+; setp's integer comparisons: lt le gt ge by the type's signedness, lo ls hi
+; hs unsigned.
+(define (int-compare cmp a b)
+  (case cmp
+    (eq (= a b)) (ne (distinct a b))
+    (lt (if-signed (bvslt a b) (bvult a b)))
+    (le (if-signed (bvsle a b) (bvule a b)))
+    (gt (if-signed (bvsgt a b) (bvugt a b)))
+    (ge (if-signed (bvsge a b) (bvuge a b)))
+    (lo (bvult a b)) (ls (bvule a b)) (hi (bvugt a b)) (hs (bvuge a b))))
+
+; setp's float comparisons: eq ... ne ordered, equ ... neu unordered, num
+; neither NaN, nan either.
+(define (float-compare cmp a b)
+  (case cmp
+    (eq (fcmp oeq a b)) (ne (fcmp one a b)) (lt (fcmp olt a b))
+    (le (fcmp ole a b)) (gt (fcmp ogt a b)) (ge (fcmp oge a b))
+    (equ (fcmp ueq a b)) (neu (fcmp une a b)) (ltu (fcmp ult a b))
+    (leu (fcmp ule a b)) (gtu (fcmp ugt a b)) (geu (fcmp uge a b))
+    (num (fcmp ord a b)) (nan (fcmp uno a b))))
+
+(define (bool-op op x c)
+  (case op (and (bvand x c)) (or (bvor x c)) (xor (bvxor x c))))
+
+; ---------------------------------------------------------------------------
+; Integer arithmetic (PTX ISA 9.7.1).
+
+; 9.7.1.1 add, 9.7.1.2 sub: modulo 2^W (no .sat, .cc).
+(instruction (add $T:int) (d a b) (set d (bvadd a b)))
+(instruction (sub $T:int) (d a b) (set d (bvsub a b)))
+
+; 9.7.1.3 mul: .lo the low W bits of the 2W-bit product, .hi the high ones,
+; .wide all 2W.
+(instruction (mul lo $T:int) (d a b) (set d (bvmul a b)))
+(instruction (mul hi $T:int) (d a b)
+  (set d (extract (- (* 2 W) 1) W (bvmul (ext a (* 2 W)) (ext b (* 2 W))))))
+(instruction (mul wide $T:int16-32) (d:2W a b)
+  (set d (bvmul (ext a (* 2 W)) (ext b (* 2 W)))))
+
+; 9.7.1.4 mad: the product's part plus c (c 2W bits for .wide).
+(instruction (mad lo $T:int) (d a b c) (set d (bvadd (bvmul a b) c)))
+(instruction (mad hi $T:int) (d a b c)
+  (set d (bvadd (extract (- (* 2 W) 1) W
+                         (bvmul (ext a (* 2 W)) (ext b (* 2 W))))
+                c)))
+(instruction (mad wide $T:int16-32) (d:2W a b c:2W)
+  (set d (bvadd (bvmul (ext a (* 2 W)) (ext b (* 2 W))) c)))
+
+; 9.7.1.8 div, 9.7.1.9 rem: "Division by zero yields an unspecified,
+; machine-specific value"; so does the signed overflow.
+(instruction (div $T:uint) (d a b)
+  (set d (ite (= b 0) (any W) (udiv a b))))
+(instruction (div $T:sint) (d a b)
+  (set d (ite (bvor (= b 0) (bvand (= b -1) (= a (bvshl 1 (- W 1)))))
+              (any W) (sdiv a b))))
+(instruction (rem $T:uint) (d a b)
+  (set d (ite (= b 0) (any W) (urem a b))))
+(instruction (rem $T:sint) (d a b)
+  (set d (ite (bvor (= b 0) (bvand (= b -1) (= a (bvshl 1 (- W 1)))))
+              (any W) (srem a b))))
+
+; 9.7.1.10 abs: of the least value, the least value. 9.7.1.11 neg.
+(instruction (abs $T:sint) (d a) (set d (abs a)))
+(instruction (neg $T:sint) (d a) (set d (bvneg a)))
+
+; 9.7.1.12 min, 9.7.1.13 max.
+(instruction (min $T:uint) (d a b) (set d (umin a b)))
+(instruction (min $T:sint) (d a b) (set d (smin a b)))
+(instruction (max $T:uint) (d a b) (set d (umax a b)))
+(instruction (max $T:sint) (d a b) (set d (smax a b)))
+
+; 9.7.1.14 popc, 9.7.1.15 clz: a 32-bit count.
+(instruction (popc $T:bits32-64) (d:32 a) (set d (zext-or-trunc (popcount a) 32)))
+(instruction (clz $T:bits32-64) (d:32 a) (set d (zext-or-trunc (clz a) 32)))
+
+; 9.7.1.17 brev.
+(instruction (brev $T:bits32-64) (d a) (set d (bitreverse a)))
+
+; 9.7.1.18 bfe: d[i] = (i < len && pos + i <= msb) ? a[pos + i] : sbit, pos
+; and len the low 8 bits of b and c; sbit 0 for .u or len 0, else
+; a[min(pos + len - 1, msb)].
+(instruction (bfe $T:int32-64) (d a b:32 c:32)
+  (let ((pos (bvand b 255)) (len (bvand c 255))
+        (out (bvugt pos (- W 1)))
+        (n (ite out 0 (umin len (bvsub W pos))))
+        (field (bvand (bvlshr a (zext-or-trunc (ite out 0 pos) W))
+                      (mask (zext-or-trunc n W))))
+        (sbit (ite (bvor (if-signed 0 1) (= len 0)) 0
+                   (extract 0 0
+                     (bvlshr a (zext-or-trunc
+                                 (umin (bvsub (bvadd pos len) 1) (- W 1))
+                                 W))))))
+    (set d (bvor field (ite (= sbit 1) (bvnot (mask (zext-or-trunc n W))) 0)))))
+
+; 9.7.1.19 bfi: b with bits pos .. pos + len - 1 (as far as msb) from a's
+; lowest.
+(instruction (bfi $T:bits32-64) (d a b c:32 e:32)
+  (let ((pos (bvand c 255)) (len (bvand e 255))
+        (out (bvugt pos (- W 1)))
+        (n (ite out 0 (umin len (bvsub W pos))))
+        (p (zext-or-trunc (ite out 0 pos) W))
+        (m (mask (zext-or-trunc n W))))
+    (set d (bvor (bvand b (bvnot (bvshl m p))) (bvshl (bvand a m) p)))))
+
+; 9.7.8.7 prmt (default mode): byte i of d is byte c[4i+2:4i] of {b, a}, its
+; sign replicated when c[4i+3].
+(instruction (prmt $T:b32) (d a b c)
+  (let ((ab (concat b a)))
+    (set d (concat (prmt-byte ab c 3)
+             (concat (prmt-byte ab c 2)
+               (concat (prmt-byte ab c 1) (prmt-byte ab c 0)))))))
+
+; 9.7.8.8 shf: the funnel shift of {b, a} by c mod 32 (.wrap) or min(c, 32)
+; (.clamp).
+(instruction (shf l wrap $T:b32) (d a b c) (set d (fshl b a (bvand c 31))))
+(instruction (shf r wrap $T:b32) (d a b c) (set d (fshr b a (bvand c 31))))
+(instruction (shf l clamp $T:b32) (d a b c)
+  (set d (ite (bvuge c 32) a (fshl b a c))))
+(instruction (shf r clamp $T:b32) (d a b c)
+  (set d (ite (bvuge c 32) b (fshr b a c))))
+
+; ---------------------------------------------------------------------------
+; Logic and shifts (PTX ISA 9.7.8).
+
+(instruction (and $T:bitsp) (d a b) (set d (bvand a b)))
+(instruction (or $T:bitsp) (d a b) (set d (bvor a b)))
+(instruction (xor $T:bitsp) (d a b) (set d (bvxor a b)))
+(instruction (not $T:bitsp) (d a) (set d (bvnot a)))
+(instruction (cnot $T:bits) (d a) (set d (ite (= a 0) 1 0)))
+
+; 9.7.8.4 shl, 9.7.8.5 shr: the amount is 32 bits unsigned; "Shift amounts
+; greater than the register width N are clamped to N": 0, or the sign for
+; shr.s.
+(instruction (shl $T:bits) (d a b:32)
+  (set d (ite (bvuge b W) 0 (bvshl a (zext-or-trunc b W)))))
+(instruction (shr $T:sint) (d a b:32)
+  (set d (bvashr a (zext-or-trunc (umin b (- W 1)) W))))
+(instruction (shr $T:ubits) (d a b:32)
+  (set d (ite (bvuge b W) 0 (bvlshr a (zext-or-trunc b W)))))
+
+; ---------------------------------------------------------------------------
+; Comparison and selection (PTX ISA 9.7.6).
+
+; 9.7.6.1 setp: p = a CMP b, [BOP c]; on floats, eq lt le gt ge ne are
+; ordered (false if either is NaN), equ ... neu unordered.
+(instruction (setp (one CMP eq ne lt le gt ge lo ls hi hs) $T:cmpint)
+             (p:pred a b)
+  (set p (int-compare CMP a b)))
+(instruction (setp (one CMP eq ne lt le gt ge lo ls hi hs)
+                   (one BOP and or xor) $T:cmpint) (p:pred a b c:pred)
+  (set p (bool-op BOP (int-compare CMP a b) c)))
+(instruction (setp (one CMP eq ne lt le gt ge equ neu ltu leu gtu geu num nan)
+                   $T:float) (p:pred a b)
+  (set p (float-compare CMP a b)))
+(instruction (setp (one CMP eq ne lt le gt ge equ neu ltu leu gtu geu num nan)
+                   (one BOP and or xor) $T:float) (p:pred a b c:pred)
+  (set p (bool-op BOP (float-compare CMP a b) c)))
+
+; 9.7.6.3 selp.
+(instruction (selp $T:any) (d a b c:pred) (set d (ite c a b)))
+
+; ---------------------------------------------------------------------------
+; Floating point (PTX ISA 9.7.3, 9.7.4). Without .ftz: subnormals are kept.
+
+; add, sub, mul: .rn rounds to nearest even; no modifier also allows ptxas
+; to contract them with a neighbouring operation into fma.
+(instruction (add rn $T:float) (d a b) (set d (fp.add a b)))
+(instruction (sub rn $T:float) (d a b) (set d (fp.sub a b)))
+(instruction (mul rn $T:float) (d a b) (set d (fp.mul a b)))
+(instruction (add $T:float) (d a b) (set d (fp.contract fp.add a b)))
+(instruction (sub $T:float) (d a b) (set d (fp.contract fp.sub a b)))
+(instruction (mul $T:float) (d a b) (set d (fp.contract fp.mul a b)))
+
+; fma and (on sm_20 and later) mad with a rounding: one rounding.
+(instruction ((one OP fma mad) rn $T:float) (d a b c) (set d (fp.fma a b c)))
+
+; div.rn, rcp.rn, sqrt.rn: IEEE, correctly rounded.
+(instruction (div rn $T:float) (d a b) (set d (fp.div a b)))
+(instruction (rcp rn $T:float) (d a) (set d (fp.div 1.0 a)))
+(instruction (sqrt rn $T:float) (d a) (set d (fp.sqrt a)))
+
+; neg, abs: the sign bit (NaNs too).
+(instruction (neg $T:float) (d a) (set d (fp.neg a)))
+(instruction (abs $T:float) (d a) (set d (fp.abs a)))
+
+; min, max: "If one of the inputs is NaN, the other is returned"; both NaN:
+; NaN.
+(instruction (min $T:float) (d a b) (set d (fp.minnum a b)))
+(instruction (max $T:float) (d a b) (set d (fp.maxnum a b)))
+
+; copysign d, a, b: b with a's sign.
+(instruction (copysign $T:float) (d a b) (set d (fp.copysign b a)))
+
+; The approximations: uninterpreted, as the NVVM intrinsics that mean them.
+(instruction (rsqrt approx f32) (d a)
+  (set d (uninterpreted "llvm.nvvm.rsqrt.approx.f" a)))
+(instruction (rsqrt approx ftz f32) (d a)
+  (set d (uninterpreted "llvm.nvvm.rsqrt.approx.ftz.f" a)))
+(instruction (rsqrt approx f64) (d a)
+  (set d (uninterpreted "llvm.nvvm.rsqrt.approx.d" a)))
+(instruction (sqrt approx f32) (d a)
+  (set d (uninterpreted "llvm.nvvm.sqrt.approx.f" a)))
+(instruction (sqrt approx ftz f32) (d a)
+  (set d (uninterpreted "llvm.nvvm.sqrt.approx.ftz.f" a)))
+(instruction (div approx f32) (d a b)
+  (set d (uninterpreted "llvm.nvvm.div.approx.f" a b)))
+(instruction (div approx ftz f32) (d a b)
+  (set d (uninterpreted "llvm.nvvm.div.approx.ftz.f" a b)))
+(instruction (lg2 approx f32) (d a)
+  (set d (uninterpreted "llvm.nvvm.lg2.approx.f" a)))
+(instruction (lg2 approx ftz f32) (d a)
+  (set d (uninterpreted "llvm.nvvm.lg2.approx.ftz.f" a)))
+(instruction (ex2 approx f32) (d a)
+  (set d (uninterpreted "llvm.nvvm.ex2.approx.f32" a)))
+(instruction (ex2 approx ftz f32) (d a)
+  (set d (uninterpreted "llvm.nvvm.ex2.approx.ftz.f32" a)))
+
+; ---------------------------------------------------------------------------
+; Conversions (PTX ISA 9.7.9.21 cvt). Integer to integer: extended by the
+; source type's signedness, or truncated. Float to integer: rounded (.rzi
+; toward zero, .rni to nearest even, .rmi down, .rpi up), saturating, NaN
+; to 0 ("For float-to-integer conversions, the result is clamped to the
+; destination range by default", "NaN ... converted to 0"). Integer to
+; float, and narrowing float to float: rounded (.rn). Float to float of the
+; same type with an integer rounding: rounded to an integral value.
+
+(instruction (cvt $D:int $S:int) (d:D a:S)
+  (set d (ext-by S a WD)))
+(instruction (cvt rzi $D:int $S:float) (d:D a:S)
+  (set d (fp.to-int-sat D a)))
+(instruction (cvt rni $D:int $S:float) (d:D a:S)
+  (set d (fp.to-int-sat D (fp.roundeven a))))
+(instruction (cvt rmi $D:int $S:float) (d:D a:S)
+  (set d (fp.to-int-sat D (fp.floor a))))
+(instruction (cvt rpi $D:int $S:float) (d:D a:S)
+  (set d (fp.to-int-sat D (fp.ceil a))))
+(instruction (cvt rn $D:float $S:sint) (d:D a:S)
+  (set d (fp.from-sint a WD)))
+(instruction (cvt rn $D:float $S:uint) (d:D a:S)
+  (set d (fp.from-uint a WD)))
+(instruction (cvt $D:float $S:float) (d:D a:S)
+  (set d (fp.extend a WD)))
+(instruction (cvt rn $D:float $S:float) (d:D a:S)
+  (set d (fp.narrow a WD)))
+(instruction (cvt rni $T:float $T:float) (d a) (set d (fp.roundeven a)))
+(instruction (cvt rzi $T:float $T:float) (d a) (set d (fp.trunc a)))
+(instruction (cvt rmi $T:float $T:float) (d a) (set d (fp.floor a)))
+(instruction (cvt rpi $T:float $T:float) (d a) (set d (fp.ceil a)))

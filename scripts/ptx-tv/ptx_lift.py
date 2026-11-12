@@ -10,10 +10,14 @@ LLVM IR function with the IR function's signature whose body is the
 per-thread meaning of the PTX, so that alive-tv can check that the PTX
 refines the IR (see README.md).
 
-The meaning of each instruction is the PTX ISA's ("Instructions"), not the
-backend's patterns: shifts by the type's width or more give 0 (or the sign),
-a division by zero gives some value, cvt to an integer saturates and takes
-NaN to 0, setp's ne is ordered, and so on. What the lifted code says:
+The meaning of each arithmetic, logic, comparison and conversion
+instruction is its entry in the PTX formalization, ptx.formal, after the PTX
+ISA ("Instructions"), not the backend's patterns: shifts by the type's width
+or more give 0 (or the sign), a division by zero gives some value, cvt to an
+integer saturates and takes NaN to 0, setp's ne is ordered, and so on. This
+file models the machine those instructions run on (registers, parameters,
+memory, control flow) and lifts the instructions that act on it. What the
+lifted code says:
 
 * Registers hold bits, never poison: they start as unknown values, a
   parameter that is poison in the IR is some value in the parameter space,
@@ -37,77 +41,31 @@ NaN to 0, setp's ne is ordered, and so on. What the lifted code says:
 """
 
 import argparse
+import os
 import re
 import struct
 import sys
 
+here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, here)
+sys.path.insert(0, os.path.join(here, '..', 'gpu-tv'))
+import ptx_formal  # noqa: E402
+# The lifters' common part: reading the source's headers and parameters.
+from gpu_lift import (LiftError, Param, function_header,  # noqa: E402
+                      one_line_headers, split_top, without_captures)
 
-class LiftError(Exception):
-  pass
+
+# The semantics of the instructions that compute (ptx.formal).
+FORMAL = ptx_formal.Formal()
 
 
 # ---------------------------------------------------------------------------
 # The input IR: the function's signature and what the lifted module needs.
 
 
-def split_top(s, sep=','):
-  """Split s at sep outside of parentheses, brackets and braces."""
-  out, depth, cur = [], 0, ''
-  for c in s:
-    if c in '([{<':
-      depth += 1
-    elif c in ')]}>':
-      depth -= 1
-    if c == sep and depth == 0:
-      out.append(cur)
-      cur = ''
-    else:
-      cur += c
-  if cur.strip():
-    out.append(cur)
-  return [x.strip() for x in out]
-
-
-class Param:
-  def __init__(self, text):
-    self.text = text
-    m = re.match(r'(ptr(?: addrspace\(\d+\))?|<[^>]*>|\[[^\]]*\]|\{[^}]*\}|'
-                 r'%[\w.$]+|\S+)', text)
-    self.type = m.group(1)
-    self.name = text.split()[-1]
-    if not self.name.startswith('%'):
-      raise LiftError('parameter without a name: ' + text)
-    self.byval = re.search(r'\bbyval\(', text) is not None
-    self.is_ptr = self.type.startswith('ptr')
-
-
-def one_line_headers(ll):
-  """The module with each function definition's header on one line."""
-  out, lines, i = [], ll.split('\n'), 0
-  while i < len(lines):
-    l = lines[i]
-    if l.startswith('define ') and '{' not in l:
-      while i + 1 < len(lines) and '{' not in l:
-        i += 1
-        l = l.rstrip() + ' ' + lines[i].strip()
-    out.append(l)
-    i += 1
-  return '\n'.join(out)
-
-
 def parse_signature(ll, name):
-  """(text before @name, return type, cc, params) of @name's definition."""
-  m = re.search(r'^define\s+(.*?)@"?' + re.escape(name) + r'"?\(', ll, re.M)
-  if not m:
-    raise LiftError('no definition of @' + name)
-  i, depth = m.end(), 1
-  while depth:
-    depth += {'(': 1, ')': -1}.get(ll[i], 0)
-    i += 1
-  params_text = ll[m.end():i - 1]
-  params = ([Param(p) for p in split_top(params_text)]
-            if params_text.strip() else [])
-  prefix = m.group(1)
+  """(return type, calling convention, params) of @name's definition."""
+  prefix, params, _ = function_header(ll, name)
   cc = 'ptx_kernel ' if re.search(r'\bptx_kernel\b', prefix) else ''
   # The return type: the last type-looking word of the prefix.
   words = re.sub(r'\b(ptx_kernel|ptx_device|dso_local|internal|private|'
@@ -119,10 +77,8 @@ def parse_signature(ll, name):
 
 
 def lifted_param(p):
-  """A parameter's text in the lifted function: without capture attributes
-  (the lifted code takes pointers apart, which they would make poison;
-  dropping them only weakens the target's assumptions)."""
-  return re.sub(r'\s*\b(captures\([^)]*\)|nocapture)', '', p.text)
+  """A parameter's text in the lifted function."""
+  return without_captures(p.text)
 
 
 def global_definitions(ll):
@@ -257,30 +213,6 @@ for _r in ('tid', 'ntid', 'ctaid', 'nctaid'):
     SREG['%%%s.%s' % (_r, _c)] = 'llvm.nvvm.read.ptx.sreg.%s.%s' % (_r, _c)
 SREG['%laneid'] = 'llvm.nvvm.read.ptx.sreg.laneid'
 SREG['%warpsize'] = 'llvm.nvvm.read.ptx.sreg.warpsize'
-
-# The approximate instructions: the NVVM intrinsics of the same meaning
-# (uninterpreted), by (opcode, ftz, type).
-APPROX = {
-    ('rsqrt', False, 'f32'): 'llvm.nvvm.rsqrt.approx.f',
-    ('rsqrt', True, 'f32'): 'llvm.nvvm.rsqrt.approx.ftz.f',
-    ('rsqrt', False, 'f64'): 'llvm.nvvm.rsqrt.approx.d',
-    ('rsqrt', True, 'f64'): 'llvm.nvvm.rsqrt.approx.ftz.d',
-    ('sqrt', False, 'f32'): 'llvm.nvvm.sqrt.approx.f',
-    ('sqrt', True, 'f32'): 'llvm.nvvm.sqrt.approx.ftz.f',
-    ('div', False, 'f32'): 'llvm.nvvm.div.approx.f',
-    ('div', True, 'f32'): 'llvm.nvvm.div.approx.ftz.f',
-    ('lg2', False, 'f32'): 'llvm.nvvm.lg2.approx.f',
-    ('lg2', True, 'f32'): 'llvm.nvvm.lg2.approx.ftz.f',
-    ('lg2', False, 'f64'): 'llvm.nvvm.lg2.approx.d',
-    ('ex2', False, 'f32'): 'llvm.nvvm.ex2.approx.f32',
-    ('ex2', True, 'f32'): 'llvm.nvvm.ex2.approx.ftz.f32',
-    ('ex2', False, 'f64'): 'llvm.nvvm.ex2.approx.f64',
-    ('rcp', True, 'f64'): 'llvm.nvvm.rcp.approx.ftz.d',
-}
-
-FCMP = {'eq': 'oeq', 'ne': 'one', 'lt': 'olt', 'le': 'ole', 'gt': 'ogt',
-        'ge': 'oge', 'equ': 'ueq', 'neu': 'une', 'ltu': 'ult', 'leu': 'ule',
-        'gtu': 'ugt', 'geu': 'uge', 'num': 'ord', 'nan': 'uno'}
 
 ATOMIC_ORDER = {'relaxed': 'monotonic', 'acquire': 'acquire',
                 'release': 'release', 'acq_rel': 'acq_rel'}
@@ -754,12 +686,19 @@ class Lifter:
         self.emit('br label %%%s' % cont)
       self.lines.append('%s:' % cont)
       return False
+    # Address arithmetic on pointers keeps their provenance.
+    if (x.base in ('add', 'sub', 'selp') and x.operands and
+        x.operands[0] in self.ptr and self.pointer_arith(x)):
+      return False
     try:
-      f = getattr(self, 'i_' + x.base)
-    except AttributeError:
-      raise LiftError('instruction not lifted: ' + str(x))
-    r = f(x)
-    return bool(r)
+      if FORMAL.lift(self, x):
+        return False
+    except ptx_formal.FormalError as e:
+      raise LiftError('ptx.formal: %s' % e)
+    f = getattr(self, 'i_' + x.base, None)
+    if f is None:
+      raise LiftError('no meaning in ptx.formal for ' + str(x))
+    return bool(f(x))
 
   def itype(self, x):
     """The instruction's type: its last type modifier."""
@@ -874,631 +813,38 @@ class Lifter:
     else:
       self.write_reg(d, self.operand(s, 64), 'i64')
 
-  # Integer arithmetic.
+  # Pointer arithmetic (what ptx.formal says of add, sub and selp, on
+  # pointers, so that the result keeps the pointer's provenance).
 
-  def binop(self, x, op, sign=False):
-    ty = self.itype(x)
-    kind, bits = TYPES[ty]
-    a = self.operand(x.operands[1], bits, sign)
-    b = self.operand(x.operands[2], bits, sign)
-    r = self.t()
-    self.emit('%s = %s i%d %s, %s' % (r, op, bits, a, b))
-    self.write_reg(x.operands[0], r, 'i%d' % bits)
-
-  def is_float(self, x):
-    return TYPES[self.itype(x)][0] in ('f', 'bf')
-
-  def i_add(self, x):
-    if self.is_float(x):
-      return self.fbinop(x, 'fadd')
-    self.no_mods(x, ())
-    d, a, b = x.operands
-    if d in self.ptr:
-      pa, pb = self.pointer(a), self.pointer(b)
-      if pa is not None and pb is None:
-        return self.write_reg(d, self.gep(pa, self.operand(b, 64)), 'ptr')
-      if pb is not None and pa is None:
-        return self.write_reg(d, self.gep(pb, self.operand(a, 64)), 'ptr')
-    self.binop(x, 'add')
-
-  def i_sub(self, x):
-    if self.is_float(x):
-      return self.fbinop(x, 'fsub')
-    self.no_mods(x, ())
-    d, a, b = x.operands
-    if d in self.ptr:
-      pa = self.pointer(a)
-      if pa is not None and self.pointer(b) is None:
+  def pointer_arith(self, x):
+    """add of a pointer and an integer, sub of an integer from a pointer,
+    selp of two pointers: whether x was one."""
+    d = x.operands[0]
+    if x.base == 'add' and len(x.operands) == 3:
+      pa, pb = self.pointer(x.operands[1]), self.pointer(x.operands[2])
+      if (pa is None) != (pb is None):
+        p, o = (pa, x.operands[2]) if pa is not None else (pb, x.operands[1])
+        self.write_reg(d, self.gep(p, self.operand(o, 64)), 'ptr')
+        return True
+    if x.base == 'sub' and len(x.operands) == 3:
+      pa = self.pointer(x.operands[1])
+      if pa is not None and self.pointer(x.operands[2]) is None:
         n = self.t()
-        self.emit('%s = sub i64 0, %s' % (n, self.operand(b, 64)))
-        return self.write_reg(d, self.gep(pa, n), 'ptr')
-    self.binop(x, 'sub')
-
-  def i_and(self, x):
-    self.binop(x, 'and')
-
-  def i_or(self, x):
-    self.binop(x, 'or')
-
-  def i_xor(self, x):
-    self.binop(x, 'xor')
-
-  def i_not(self, x):
-    ty = self.itype(x)
-    bits = TYPES[ty][1]
-    a = self.operand(x.operands[1], bits)
-    r = self.t()
-    self.emit('%s = xor i%d %s, -1' % (r, bits, a))
-    self.write_reg(x.operands[0], r, 'i%d' % bits)
-
-  def i_cnot(self, x):
-    bits = TYPES[self.itype(x)][1]
-    a = self.operand(x.operands[1], bits)
-    c, r = self.t(), self.t()
-    self.emit('%s = icmp eq i%d %s, 0' % (c, bits, a))
-    self.emit('%s = zext i1 %s to i%d' % (r, c, bits))
-    self.write_reg(x.operands[0], r, 'i%d' % bits)
-
-  def mul_parts(self, x):
-    """(mode, signed, bits) of mul/mad: mode lo, hi or wide."""
-    ty = self.itype(x)
-    kind, bits = TYPES[ty]
-    mode = 'lo'
-    for m in ('lo', 'hi', 'wide'):
-      if x.has(m):
-        mode = m
-    return mode, kind == 's', bits
-
-  def product(self, x, a, b):
-    mode, sg, bits = self.mul_parts(x)
-    av = self.operand(a, bits, sg)
-    bv = self.operand(b, bits, sg)
-    if mode == 'lo':
-      r = self.t()
-      self.emit('%s = mul i%d %s, %s' % (r, bits, av, bv))
-      return r, bits
-    w = 2 * bits
-    ea, eb = self.resize(av, bits, w, sg), self.resize(bv, bits, w, sg)
-    p = self.t()
-    self.emit('%s = mul i%d %s, %s' % (p, w, ea, eb))
-    if mode == 'wide':
-      return p, w
-    h = self.t()
-    self.emit('%s = lshr i%d %s, %d' % (h, w, p, bits))
-    return self.resize(h, w, bits, False), bits
-
-  def i_mul(self, x):
-    if self.is_float(x):
-      return self.fbinop(x, 'fmul')
-    if x.has('24'):
-      raise LiftError('mul24 not lifted: ' + str(x))
-    p, bits = self.product(x, x.operands[1], x.operands[2])
-    self.write_reg(x.operands[0], p, 'i%d' % bits)
-
-  def i_mad(self, x):
-    if self.is_float(x):
-      return self.ffma(x)
-    if x.has('24', 'cc', 'sat'):
-      raise LiftError('mad modifier not lifted: ' + str(x))
-    p, bits = self.product(x, x.operands[1], x.operands[2])
-    c = self.operand(x.operands[3], bits)
-    r = self.t()
-    self.emit('%s = add i%d %s, %s' % (r, bits, p, c))
-    self.write_reg(x.operands[0], r, 'i%d' % bits)
-
-  def i_div(self, x):
-    if self.is_float(x):
-      return self.fdiv(x)
-    self.divrem(x, 'div')
-
-  def i_rem(self, x):
-    self.divrem(x, 'rem')
-
-  def divrem(self, x, what):
-    """A division by zero (or of the least value by -1) gives some value
-    (PTX ISA: "unspecified, machine-specific")."""
-    kind, bits = TYPES[self.itype(x)]
-    sg = kind == 's'
-    a = self.operand(x.operands[1], bits)
-    b = self.operand(x.operands[2], bits)
-    T = 'i%d' % bits
-    bad = self.t()
-    self.emit('%s = icmp eq %s %s, 0' % (bad, T, b))
-    if sg:
-      m1, mn, both, bad2 = self.t(), self.t(), self.t(), self.t()
-      self.emit('%s = icmp eq %s %s, -1' % (m1, T, b))
-      self.emit('%s = icmp eq %s %s, %d' % (mn, T, a, -(1 << (bits - 1))))
-      self.emit('%s = and i1 %s, %s' % (both, m1, mn))
-      self.emit('%s = or i1 %s, %s' % (bad2, bad, both))
-      bad = bad2
-    sb, q, any_, r = self.t(), self.t(), self.t(), self.t()
-    self.emit('%s = select i1 %s, %s 1, %s %s' % (sb, bad, T, T, b))
-    op = ('s' if sg else 'u') + what
-    self.emit('%s = %s %s %s, %s' % (q, op, T, a, sb))
-    self.emit('%s = freeze %s poison' % (any_, T))
-    self.emit('%s = select i1 %s, %s %s, %s %s' % (r, bad, T, any_, T, q))
-    self.write_reg(x.operands[0], r, T)
-
-  def i_neg(self, x):
-    if self.is_float(x):
-      return self.funop(x, 'fneg')
-    bits = TYPES[self.itype(x)][1]
-    a = self.operand(x.operands[1], bits)
-    r = self.t()
-    self.emit('%s = sub i%d 0, %s' % (r, bits, a))
-    self.write_reg(x.operands[0], r, 'i%d' % bits)
-
-  def i_abs(self, x):
-    if self.is_float(x):
-      return self.funop(x, 'fabs')
-    bits = TYPES[self.itype(x)][1]
-    a = self.operand(x.operands[1], bits)
-    r = self.intr('abs', 'i%d' % bits, [('i%d' % bits, a), ('i1', 'false')])
-    self.write_reg(x.operands[0], r, 'i%d' % bits)
-
-  def minmax(self, x, which):
-    if self.is_float(x):
-      return self.fminmax(x, which)
-    kind, bits = TYPES[self.itype(x)]
-    T = 'i%d' % bits
-    a = self.operand(x.operands[1], bits)
-    b = self.operand(x.operands[2], bits)
-    r = self.intr(('s' if kind == 's' else 'u') + which, T,
-                  [(T, a), (T, b)])
-    self.write_reg(x.operands[0], r, T)
-
-  def i_min(self, x):
-    self.minmax(x, 'min')
-
-  def i_max(self, x):
-    self.minmax(x, 'max')
-
-  def shift(self, x, op):
-    """Shifts by the width or more: 0, or the sign for shr.s (PTX ISA:
-    "Shift amounts greater than the register width N are clamped to N")."""
-    kind, bits = TYPES[self.itype(x)]
-    T = 'i%d' % bits
-    a = self.operand(x.operands[1], bits)
-    s = self.operand(x.operands[2], 32)
-    big, cl = self.t(), self.t()
-    self.emit('%s = icmp uge i32 %s, %d' % (big, s, bits))
-    self.emit('%s = select i1 %s, i32 %d, i32 %s' % (cl, big, bits - 1, s))
-    amt = self.resize(cl, 32, bits, False)
-    r = self.t()
-    if op == 'shr' and kind == 's':
-      self.emit('%s = ashr %s %s, %s' % (r, T, a, amt))
-    else:
-      v = self.t()
-      self.emit('%s = %s %s %s, %s' % (v, 'shl' if op == 'shl' else 'lshr',
-                                       T, a, amt))
-      self.emit('%s = select i1 %s, %s 0, %s %s' % (r, big, T, T, v))
-    self.write_reg(x.operands[0], r, T)
-
-  def i_shl(self, x):
-    self.shift(x, 'shl')
-
-  def i_shr(self, x):
-    self.shift(x, 'shr')
-
-  def i_shf(self, x):
-    """shf.{l,r}.{wrap,clamp}.b32 d, a, b, c: the funnel shift of {b, a}
-    (b the high word) by c mod 32 (wrap) or min(c, 32) (clamp)."""
-    left = x.has('l')
-    if not (left or x.has('r')) or not (x.has('wrap') or x.has('clamp')):
-      raise LiftError('shf not lifted: ' + str(x))
-    a = self.operand(x.operands[1], 32)
-    b = self.operand(x.operands[2], 32)
-    c = self.operand(x.operands[3], 32)
-    if x.has('wrap'):
-      n = self.t()
-      self.emit('%s = and i32 %s, 31' % (n, c))
-      # fshl/fshr take the amount mod 32.
-      r = self.intr('fshl' if left else 'fshr', 'i32',
-                    [('i32', b), ('i32', a), ('i32', n)])
-    else:
-      big = self.t()
-      self.emit('%s = icmp uge i32 %s, 32' % (big, c))
-      f = self.intr('fshl' if left else 'fshr', 'i32',
-                    [('i32', b), ('i32', a), ('i32', c)])
-      r = self.t()
-      # Shifted by 32 or more: the whole other word.
-      self.emit('%s = select i1 %s, i32 %s, i32 %s' % (r, big,
-                                                       a if left else b, f))
-    self.write_reg(x.operands[0], r, 'i32')
-
-  def i_popc(self, x):
-    bits = TYPES[self.itype(x)][1]
-    T = 'i%d' % bits
-    r = self.intr('ctpop', T, [(T, self.operand(x.operands[1], bits))])
-    self.write_reg(x.operands[0], self.resize(r, bits, 32, False), 'i32')
-
-  def i_clz(self, x):
-    bits = TYPES[self.itype(x)][1]
-    T = 'i%d' % bits
-    r = self.intr('ctlz', T, [(T, self.operand(x.operands[1], bits)),
-                              ('i1', 'false')])
-    self.write_reg(x.operands[0], self.resize(r, bits, 32, False), 'i32')
-
-  def i_brev(self, x):
-    bits = TYPES[self.itype(x)][1]
-    T = 'i%d' % bits
-    r = self.intr('bitreverse', T, [(T, self.operand(x.operands[1], bits))])
-    self.write_reg(x.operands[0], r, T)
-
-  def field_mask(self, n, bits):
-    """An i<bits> mask of the n (i<bits>, at most bits) lowest bits."""
-    T = 'i%d' % bits
-    full, sh, m1, m = self.t(), self.t(), self.t(), self.t()
-    self.emit('%s = icmp uge %s %s, %d' % (full, T, n, bits))
-    self.emit('%s = shl %s 1, %s' % (sh, T, n))
-    self.emit('%s = sub %s %s, 1' % (m1, T, sh))
-    self.emit('%s = select i1 %s, %s -1, %s %s' % (m, full, T, T, m1))
-    return m
-
-  def i_bfe(self, x):
-    """PTX ISA, bfe: d[i] = (i < len && pos + i <= msb) ? a[pos + i] : sbit,
-    sbit 0 for .u or len 0, else a[min(pos + len - 1, msb)]."""
-    kind, bits = TYPES[self.itype(x)]
-    T = 'i%d' % bits
-    a = self.operand(x.operands[1], bits)
-    pos32, len32 = (self.operand(x.operands[2], 32),
-                    self.operand(x.operands[3], 32))
-    pos, ln = self.t(), self.t()
-    self.emit('%s = and i32 %s, 255' % (pos, pos32))
-    self.emit('%s = and i32 %s, 255' % (ln, len32))
-    out = self.t()
-    self.emit('%s = icmp ugt i32 %s, %d' % (out, pos, bits - 1))
-    avail, n = self.t(), self.t()
-    self.emit('%s = sub i32 %d, %s' % (avail, bits, pos))
-    self.emit('%s = call i32 @llvm.umin.i32(i32 %s, i32 %s)' % (n, ln, avail))
-    self.declare('llvm.umin.i32', 'i32', ['i32', 'i32'])
-    n2 = self.t()
-    self.emit('%s = select i1 %s, i32 0, i32 %s' % (n2, out, n))
-    ps, sh = self.t(), self.t()
-    self.emit('%s = select i1 %s, i32 0, i32 %s' % (ps, out, pos))
-    self.emit('%s = lshr %s %s, %s' % (sh, T, a, self.resize(ps, 32, bits,
-                                                              False)))
-    m = self.field_mask(self.resize(n2, 32, bits, False), bits)
-    f = self.t()
-    self.emit('%s = and %s %s, %s' % (f, T, sh, m))
-    if kind == 's':
-      top, ti, tc, bit, z, sb = (self.t(), self.t(), self.t(), self.t(),
-                                 self.t(), self.t())
-      self.emit('%s = add i32 %s, %s' % (top, pos, ln))
-      self.emit('%s = sub i32 %s, 1' % (ti, top))
-      self.emit('%s = call i32 @llvm.umin.i32(i32 %s, i32 %d)' %
-                (tc, ti, bits - 1))
-      self.emit('%s = lshr %s %s, %s' % (bit, T, a, self.resize(tc, 32, bits,
-                                                                 False)))
-      self.emit('%s = icmp eq i32 %s, 0' % (z, ln))
-      b1, inv, sx, r = self.t(), self.t(), self.t(), self.t()
-      self.emit('%s = trunc %s %s to i1' % (b1, T, bit))
-      self.emit('%s = select i1 %s, i1 false, i1 %s' % (sb, z, b1))
-      self.emit('%s = xor %s %s, -1' % (inv, T, m))
-      self.emit('%s = select i1 %s, %s %s, %s 0' % (sx, sb, T, inv, T))
-      self.emit('%s = or %s %s, %s' % (r, T, f, sx))
-      f = r
-    self.write_reg(x.operands[0], f, T)
-
-  def i_bfi(self, x):
-    """PTX ISA, bfi: f = b; f[pos + i] = a[i] for i < len, pos + i <= msb."""
-    bits = TYPES[self.itype(x)][1]
-    T = 'i%d' % bits
-    a = self.operand(x.operands[1], bits)
-    b = self.operand(x.operands[2], bits)
-    pos32, len32 = (self.operand(x.operands[3], 32),
-                    self.operand(x.operands[4], 32))
-    pos, ln, out, avail, n, n2, ps = (self.t(), self.t(), self.t(), self.t(),
-                                      self.t(), self.t(), self.t())
-    self.emit('%s = and i32 %s, 255' % (pos, pos32))
-    self.emit('%s = and i32 %s, 255' % (ln, len32))
-    self.emit('%s = icmp ugt i32 %s, %d' % (out, pos, bits - 1))
-    self.emit('%s = sub i32 %d, %s' % (avail, bits, pos))
-    self.declare('llvm.umin.i32', 'i32', ['i32', 'i32'])
-    self.emit('%s = call i32 @llvm.umin.i32(i32 %s, i32 %s)' % (n, ln, avail))
-    self.emit('%s = select i1 %s, i32 0, i32 %s' % (n2, out, n))
-    self.emit('%s = select i1 %s, i32 0, i32 %s' % (ps, out, pos))
-    psT = self.resize(ps, 32, bits, False)
-    m = self.field_mask(self.resize(n2, 32, bits, False), bits)
-    am, ash, msh, inv, bm, r = (self.t(), self.t(), self.t(), self.t(),
-                                self.t(), self.t())
-    self.emit('%s = and %s %s, %s' % (am, T, a, m))
-    self.emit('%s = shl %s %s, %s' % (ash, T, am, psT))
-    self.emit('%s = shl %s %s, %s' % (msh, T, m, psT))
-    self.emit('%s = xor %s %s, -1' % (inv, T, msh))
-    self.emit('%s = and %s %s, %s' % (bm, T, b, inv))
-    self.emit('%s = or %s %s, %s' % (r, T, bm, ash))
-    self.write_reg(x.operands[0], r, T)
-
-  def i_prmt(self, x):
-    """prmt.b32 (default mode): byte i of d is byte c[4i+2:4i] of {b, a},
-    its sign replicated when c[4i+3]."""
-    if len(x.mods) != 2:
-      raise LiftError('prmt mode not lifted: ' + str(x))
-    a = self.operand(x.operands[1], 32)
-    b = self.operand(x.operands[2], 32)
-    c = self.operand(x.operands[3], 32)
-    a64, b64, bh, ab = self.t(), self.t(), self.t(), self.t()
-    self.emit('%s = zext i32 %s to i64' % (a64, a))
-    self.emit('%s = zext i32 %s to i64' % (b64, b))
-    self.emit('%s = shl i64 %s, 32' % (bh, b64))
-    self.emit('%s = or i64 %s, %s' % (ab, bh, a64))
-    acc = '0'
-    for i in range(4):
-      s, sel, s8, s64, by, sg, rep, sx, b32, bsh, o = [self.t()
-                                                       for _ in range(11)]
-      self.emit('%s = lshr i32 %s, %d' % (s, c, 4 * i))
-      self.emit('%s = and i32 %s, 7' % (sel, s))
-      self.emit('%s = mul i32 %s, 8' % (s8, sel))
-      self.emit('%s = zext i32 %s to i64' % (s64, s8))
-      sh = self.t()
-      self.emit('%s = lshr i64 %s, %s' % (sh, ab, s64))
-      self.emit('%s = trunc i64 %s to i8' % (by, sh))
-      self.emit('%s = and i32 %s, 8' % (sg, s))
-      self.emit('%s = ashr i8 %s, 7' % (rep, by))
-      c8 = self.t()
-      self.emit('%s = icmp ne i32 %s, 0' % (c8, sg))
-      self.emit('%s = select i1 %s, i8 %s, i8 %s' % (sx, c8, rep, by))
-      self.emit('%s = zext i8 %s to i32' % (b32, sx))
-      self.emit('%s = shl i32 %s, %d' % (bsh, b32, 8 * i))
-      self.emit('%s = or i32 %s, %s' % (o, acc, bsh))
-      acc = o
-    self.write_reg(x.operands[0], acc, 'i32')
-
-  # Comparisons and selection.
-
-  def i_setp(self, x):
-    """setp.cmp[.bop].type p, a, b[, [!]c]: p = (a cmp b) [bop c]."""
-    bop = [m for m in x.mods[1:] if m in ('and', 'or', 'xor')]
-    if (len(x.operands) != (4 if bop else 3) or '|' in x.operands[0]):
-      raise LiftError('setp form not lifted: ' + str(x))
-    ty = self.itype(x)
-    kind, bits = TYPES[ty]
-    cmp = x.mods[1]
-    if x.has('ftz'):
-      raise LiftError('setp modifier not lifted: ' + str(x))
-    r = self.t()
-    if kind in ('f', 'bf'):
-      ft = FLOAT_TYPE[(kind, bits)]
-      a = self.fp(self.operand(x.operands[1], bits), bits, ft)
-      b = self.fp(self.operand(x.operands[2], bits), bits, ft)
-      if cmp not in FCMP:
-        raise LiftError('comparison ' + str(x))
-      self.emit('%s = fcmp %s %s %s, %s' % (r, FCMP[cmp], ft, a, b))
-    else:
-      a = self.operand(x.operands[1], bits)
-      b = self.operand(x.operands[2], bits)
-      pred = {'eq': 'eq', 'ne': 'ne', 'lt': 'lt', 'le': 'le', 'gt': 'gt',
-              'ge': 'ge', 'lo': 'ult', 'ls': 'ule', 'hi': 'ugt',
-              'hs': 'uge'}.get(cmp)
-      if pred is None:
-        raise LiftError('comparison ' + str(x))
-      if pred in ('lt', 'le', 'gt', 'ge'):
-        pred = ('s' if kind == 's' else 'u') + pred
-      self.emit('%s = icmp %s i%d %s, %s' % (r, pred, bits, a, b))
-    if bop:
-      c = x.operands[3].strip()
-      cv = self.operand(c.lstrip('!'), 1)
-      if c.startswith('!'):
-        n = self.t()
-        self.emit('%s = xor i1 %s, true' % (n, cv))
-        cv = n
-      r2 = self.t()
-      self.emit('%s = %s i1 %s, %s' % (r2, bop[0], r, cv))
-      r = r2
-    self.write_reg(x.operands[0], r, 'i1')
-
-  def i_selp(self, x):
-    d, a, b, c = x.operands
-    bits = TYPES[self.itype(x)][1]
-    p = self.operand(c, 1)
-    r = self.t()
-    if d in self.ptr:
-      pa, pb = self.pointer(a), self.pointer(b)
+        self.emit('%s = sub i64 0, %s' % (n, self.operand(x.operands[2], 64)))
+        self.write_reg(d, self.gep(pa, n), 'ptr')
+        return True
+    if x.base == 'selp' and len(x.operands) == 4:
+      pa, pb = self.pointer(x.operands[1]), self.pointer(x.operands[2])
       if pa is not None and pb is not None:
-        self.emit('%s = select i1 %s, ptr %s, ptr %s' % (r, p, pa, pb))
-        return self.write_reg(d, r, 'ptr')
-    av, bv = self.operand(a, bits), self.operand(b, bits)
-    self.emit('%s = select i1 %s, i%d %s, i%d %s' % (r, p, bits, av, bits, bv))
-    self.write_reg(d, r, 'i%d' % bits)
-
-  # Floating point.
-
-  def fparts(self, x):
-    """(LLVM type, bits) of a float instruction; rejects what is not
-    lifted: other roundings than to nearest, ftz, sat."""
-    ty = self.itype(x)
-    kind, bits = TYPES[ty]
-    if (kind, bits) not in FLOAT_TYPE:
-      raise LiftError('float type not lifted: ' + str(x))
-    for m in x.mods[1:]:
-      if m in ('rz', 'rm', 'rp'):
-        raise LiftError('rounding .%s not lifted: %s' % (m, x))
-      if m in ('ftz', 'sat', 'relu'):
-        raise LiftError('modifier .%s not lifted: %s' % (m, x))
-    return FLOAT_TYPE[(kind, bits)], bits
-
-  def flags(self, x):
-    """add/sub/mul without a rounding modifier may be contracted into fma
-    (PTX ISA, "Floating-Point Instructions")."""
-    return '' if x.has('rn') else 'contract '
+        r = self.t()
+        self.emit('%s = select i1 %s, ptr %s, ptr %s' %
+                  (r, self.operand(x.operands[3], 1), pa, pb))
+        self.write_reg(d, r, 'ptr')
+        return True
+    return False
 
   def fval(self, tok, bits, ft):
     return self.fp(self.operand(tok, bits), bits, ft)
-
-  def fresult(self, x, v, ft, bits):
-    self.write_reg(x.operands[0], self.unfp(v, ft, bits), 'i%d' % bits)
-
-  def fbinop(self, x, op):
-    ft, bits = self.fparts(x)
-    a = self.fval(x.operands[1], bits, ft)
-    b = self.fval(x.operands[2], bits, ft)
-    r = self.t()
-    self.emit('%s = %s %s%s %s, %s' % (r, op, self.flags(x), ft, a, b))
-    self.fresult(x, r, ft, bits)
-
-  def funop(self, x, op):
-    ft, bits = self.fparts(x)
-    a = self.fval(x.operands[1], bits, ft)
-    r = self.t()
-    if op == 'fneg':
-      self.emit('%s = fneg %s %s' % (r, ft, a))
-    else:
-      r = self.intr(op, ft, [(ft, a)])
-    self.fresult(x, r, ft, bits)
-
-  def ffma(self, x):
-    if not x.has('rn'):
-      raise LiftError('fma/mad without rounding not lifted: ' + str(x))
-    ft, bits = self.fparts(x)
-    a, b, c = [self.fval(o, bits, ft) for o in x.operands[1:4]]
-    r = self.intr('fma', ft, [(ft, a), (ft, b), (ft, c)])
-    self.fresult(x, r, ft, bits)
-
-  i_fma = ffma
-
-  def approx(self, x, n):
-    ty = self.itype(x)
-    name = APPROX.get((x.base, x.has('ftz'), ty))
-    if name is None:
-      raise LiftError('approximation not lifted: ' + str(x))
-    bits = TYPES[ty][1]
-    ft = FLOAT_TYPE[TYPES[ty]]
-    args = [(ft, self.fval(o, bits, ft)) for o in x.operands[1:1 + n]]
-    r = self.call(name, ft, args, ' nounwind readnone')
-    self.fresult(x, r, ft, bits)
-
-  def fdiv(self, x):
-    if x.has('approx'):
-      return self.approx(x, 2)
-    if x.has('full') or not x.has('rn'):
-      raise LiftError('division not lifted: ' + str(x))
-    self.fbinop(x, 'fdiv')
-
-  def i_sqrt(self, x):
-    if x.has('approx'):
-      return self.approx(x, 1)
-    if not x.has('rn'):
-      raise LiftError('sqrt not lifted: ' + str(x))
-    self.funop(x, 'sqrt')
-
-  def i_rcp(self, x):
-    if x.has('approx'):
-      return self.approx(x, 1)
-    if not x.has('rn'):
-      raise LiftError('rcp not lifted: ' + str(x))
-    ft, bits = self.fparts(x)
-    a = self.fval(x.operands[1], bits, ft)
-    r = self.t()
-    self.emit('%s = fdiv %s 1.0, %s' % (r, ft, a))
-    self.fresult(x, r, ft, bits)
-
-  def i_rsqrt(self, x):
-    self.approx(x, 1)
-
-  def i_ex2(self, x):
-    self.approx(x, 1)
-
-  def i_lg2(self, x):
-    self.approx(x, 1)
-
-  def fminmax(self, x, which):
-    """min/max.f: a NaN operand gives the other (both NaN: NaN), as
-    minnum/maxnum."""
-    if x.has('NaN', 'xorsign', 'abs'):
-      raise LiftError('min/max modifier not lifted: ' + str(x))
-    ft, bits = self.fparts(x)
-    a = self.fval(x.operands[1], bits, ft)
-    b = self.fval(x.operands[2], bits, ft)
-    r = self.intr(which + 'num', ft, [(ft, a), (ft, b)])
-    self.fresult(x, r, ft, bits)
-
-  def i_copysign(self, x):
-    # copysign.f d, a, b: b with a's sign.
-    ft, bits = self.fparts(x)
-    a = self.fval(x.operands[1], bits, ft)
-    b = self.fval(x.operands[2], bits, ft)
-    r = self.intr('copysign', ft, [(ft, b), (ft, a)])
-    self.fresult(x, r, ft, bits)
-
-  def i_testp(self, x):
-    raise LiftError('testp not lifted: ' + str(x))
-
-  # Conversions.
-
-  def i_cvt(self, x):
-    tys = [m for m in x.mods[1:] if m in TYPES]
-    if len(tys) != 2:
-      raise LiftError('cvt types: ' + str(x))
-    dt, st = tys
-    dk, db = TYPES[dt]
-    sk, sb = TYPES[st]
-    rnd = [m for m in x.mods[1:] if m in ('rn', 'rz', 'rm', 'rp', 'rni',
-                                          'rzi', 'rmi', 'rpi', 'rna')]
-    rnd = rnd[0] if rnd else None
-    for m in x.mods[1:]:
-      if m in ('ftz', 'sat', 'relu', 'satfinite'):
-        raise LiftError('cvt modifier .%s not lifted: %s' % (m, x))
-    dfl, sfl = dk in ('f', 'bf'), sk in ('f', 'bf')
-    d, s = x.operands
-    if not dfl and not sfl:
-      # Integers: extend by the source's type, or truncate.
-      v = self.operand(s, sb, sk == 's')
-      v = self.resize(v, sb, db, sk == 's')
-      dbits = self.reg(d)
-      v = self.resize(v, db, max(db, dbits) if dbits > db else db,
-                      dk == 's')
-      self.write_reg(d, v, 'i%d' % (max(db, dbits) if dbits > db else db))
-      return
-    if sfl:
-      sft = FLOAT_TYPE[(sk, sb)]
-      a = self.fval(s, sb, sft)
-    if not sfl:
-      a = self.operand(s, sb)
-    if sfl and dfl:
-      dft = FLOAT_TYPE[(dk, db)]
-      if rnd in ('rni', 'rzi', 'rmi', 'rpi'):
-        if dt != st:
-          raise LiftError('cvt: ' + str(x))
-        fn = {'rni': 'roundeven', 'rzi': 'trunc', 'rmi': 'floor',
-              'rpi': 'ceil'}[rnd]
-        r = self.intr(fn, sft, [(sft, a)])
-      elif db > sb:
-        if rnd:
-          raise LiftError('cvt: ' + str(x))
-        r = self.cast('fpext', a, sft, dft)
-      elif db < sb:
-        if rnd != 'rn':
-          raise LiftError('cvt rounding not lifted: ' + str(x))
-        r = self.cast('fptrunc', a, sft, dft)
-      else:
-        raise LiftError('cvt: ' + str(x))
-      self.write_reg(d, self.unfp(r, dft, db), 'i%d' % db)
-      return
-    if sfl:
-      # Float to integer: rounded, saturating, NaN to 0 (PTX ISA, cvt).
-      fn = {'rni': 'roundeven', 'rzi': None, 'rmi': 'floor',
-            'rpi': 'ceil'}.get(rnd, 'bad')
-      if fn == 'bad':
-        raise LiftError('cvt rounding not lifted: ' + str(x))
-      if fn:
-        a = self.intr(fn, sft, [(sft, a)])
-      it = 'i%d' % db
-      name = 'llvm.fpto%si.sat.%s.%s' % ('s' if dk == 's' else 'u', it,
-                                         {'float': 'f32', 'double': 'f64',
-                                          'half': 'f16',
-                                          'bfloat': 'bf16'}[sft])
-      r = self.call(name, it, [(sft, a)])
-      dbits = self.reg(d)
-      self.write_reg(d, self.resize(r, db, max(db, dbits), dk == 's'),
-                     'i%d' % max(db, dbits))
-      return
-    # Integer to float.
-    dft = FLOAT_TYPE[(dk, db)]
-    if rnd != 'rn':
-      raise LiftError('cvt rounding not lifted: ' + str(x))
-    r = self.cast('sitofp' if sk == 's' else 'uitofp', a, 'i%d' % sb, dft)
-    self.write_reg(d, self.unfp(r, dft, db), 'i%d' % db)
 
   # Memory.
 
