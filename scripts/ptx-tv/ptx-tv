@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Translation validation of the NVPTX backend: compile an LLVM IR module for
+# NVIDIA GPUs with llc, lift each function's PTX back to LLVM IR
+# (ptx_lift.py) and check with alive-tv that the PTX refines the IR.
+#
+#   ptx-tv [-mcpu=sm_80] [--keep DIR] [--ptx FILE] [--func NAME]
+#          kernel.ll [alive-tv options...]
+#
+# --ptx lifts the given PTX instead of llc's; --func checks only that
+# function (default: every function the module defines).
+#
+# Inputs are taken not to be undef (alive-tv -disable-undef-input): the
+# lifted code freezes what it reads from parameters, as the hardware holds
+# bits, and an undef input makes each such freeze a quantifier the solver
+# rarely gets past. --undef checks undef inputs too. Poison inputs are
+# always checked.
+#
+# LLC, OPT and ALIVE_TV name the tools (default: on PATH). alive-tv must be
+# built from this repository: it gives NVPTX's address spaces, special
+# registers and barriers their meaning (llvm_util/gpu.h).
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+LLC=${LLC:-llc}
+OPT=${OPT:-opt}
+ALIVE_TV=${ALIVE_TV:-alive-tv}
+cpu=sm_80
+keep=
+ptx=
+only=
+undef=(-disable-undef-input)
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -mcpu=*) cpu=${1#-mcpu=}; shift ;;
+    --keep) keep=$2; shift 2 ;;
+    --ptx) ptx=$2; shift 2 ;;
+    --func) only=$2; shift 2 ;;
+    --undef) undef=(); shift ;;
+    *) break ;;
+  esac
+done
+in=$1; shift
+dir=${keep:-$(mktemp -d)}
+mkdir -p "$dir"
+# The source as opt reads it (auto-upgraded intrinsics, the target's
+# datalayout), without passes; without !tbaa, which alive2 does not
+# translate (dropping it only drops assumptions).
+"$OPT" -mtriple=nvptx64-nvidia-cuda -passes=verify -S "$in" |
+  sed -E 's/, !tbaa(\.struct)? ![0-9]+//g' > "$dir/src.ll"
+if [[ -n $ptx ]]; then
+  cp "$ptx" "$dir/out.ptx"
+else
+  "$LLC" -mtriple=nvptx64-nvidia-cuda -mcpu="$cpu" "$dir/src.ll" \
+    -o "$dir/out.ptx"
+fi
+status=0
+funcs=$only
+if [[ -z $funcs ]]; then
+  funcs=$(grep -oP '^define\s+[^@]*@\K[A-Za-z0-9_.$]+(?=\()' "$dir/src.ll")
+fi
+for f in $funcs; do
+  if ! python3 "$here/ptx_lift.py" "$dir/src.ll" "$dir/out.ptx" "$f" \
+         -o "$dir/$f.lifted.raw.ll"; then
+    status=2; continue
+  fi
+  # Registers to SSA values (the lifter keeps them in allocas).
+  if ! "$OPT" -passes=sroa,mem2reg -S "$dir/$f.lifted.raw.ll" \
+         -o "$dir/$f.lifted.ll"; then
+    echo "ptx-tv: the lifted $f is not valid IR" >&2
+    status=2; continue
+  fi
+  echo "== $f"
+  "$ALIVE_TV" "$dir/src.ll" "$dir/$f.lifted.ll" -func="$f" "${undef[@]}" "$@" ||
+    status=1
+done
+[[ -z $keep ]] && rm -rf "$dir"
+exit $status

@@ -13,6 +13,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/ReplaceConstant.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
@@ -33,6 +34,12 @@ constexpr unsigned AGXKernelCC = 128;
 
 bool is_agx_module(const Module &M) {
   return StringRef(M.getTargetTriple().str()).starts_with("agx");
+}
+
+// NVIDIA GPUs: the NVPTX target's IR (ptx_kernel kernels, llvm.nvvm.*
+// intrinsics, address spaces global 1, shared 3, const 4, local 5).
+bool is_nvptx_module(const Module &M) {
+  return StringRef(M.getTargetTriple().str()).starts_with("nvptx");
 }
 
 // OpenCL / SPIR-V work-item builtins, as upstream GPU IR calls them.
@@ -164,6 +171,7 @@ struct GPUCanonicalizer : ValueMaterializer {
   Module &M;
   LLVMContext &Ctx;
   bool AGX;
+  bool NVPTX;
   FlatTypes Types;
   // The twelve primitive system values, by name ("threads_per_threadgroup.x").
   StringMap<Value *> SR;
@@ -171,7 +179,7 @@ struct GPUCanonicalizer : ValueMaterializer {
 
   GPUCanonicalizer(GPUCanonicalFunction &Out, Function &F)
       : Out(Out), F(F), M(*F.getParent()), Ctx(F.getContext()),
-        AGX(is_agx_module(M)), I32(Type::getInt32Ty(Ctx)) {}
+        AGX(is_agx_module(M)), NVPTX(is_nvptx_module(M)), I32(Type::getInt32Ty(Ctx)) {}
 
   // -------------------------------------------------------------------------
   // Declarations of the canonical form.
@@ -526,6 +534,7 @@ struct GPUCanonicalizer : ValueMaterializer {
   bool isKernel(Function &Fn) {
     if (Fn.getCallingConv() == AGXKernelCC ||
         Fn.getCallingConv() == CallingConv::SPIR_KERNEL ||
+        Fn.getCallingConv() == CallingConv::PTX_Kernel ||
         Fn.hasFnAttribute("air-kernel") || Fn.hasFnAttribute("kernel") ||
         Fn.hasFnAttribute("gpu.kernel"))
       return true;
@@ -568,6 +577,31 @@ struct GPUCanonicalizer : ValueMaterializer {
     // The body to translate: F's, its calls inlined.
     Function *Src = inlinedCopy();
     Out.created.push_back(Src);
+    // Casts between address spaces in constants (NVPTX's generic pointers
+    // to shared variables) as instructions, which become no casts below.
+    {
+      SmallVector<Constant *, 4> Casts;
+      SmallPtrSet<Constant *, 8> Seen;
+      SmallVector<Constant *, 8> Work;
+      for (Instruction &I : instructions(*Src))
+        for (Value *Op : I.operands())
+          if (auto *CE = dyn_cast<ConstantExpr>(Op))
+            Work.push_back(CE);
+      while (!Work.empty()) {
+        Constant *C = Work.pop_back_val();
+        if (!Seen.insert(C).second)
+          continue;
+        if (auto *CE = dyn_cast<ConstantExpr>(C)) {
+          if (CE->getOpcode() == Instruction::AddrSpaceCast)
+            Casts.push_back(CE);
+          for (Value *Op : CE->operands())
+            if (auto *OC = dyn_cast<ConstantExpr>(Op))
+              Work.push_back(OC);
+        }
+      }
+      if (!Casts.empty())
+        convertUsersOfConstantsToInstructions(Casts, Src, false, true);
+    }
 
     // The dynamic threadgroup memory F uses (AGX).
     GlobalVariable *DynTG = nullptr;
@@ -581,7 +615,9 @@ struct GPUCanonicalizer : ValueMaterializer {
           DynTG = &G;
 
     // Parameters: the others in order, then the threadgroup buffers. A
-    // kernel takes a value as AIR passes it, in a constant buffer.
+    // kernel takes a value as AIR passes it, in a constant buffer (not an
+    // NVPTX kernel: PTX passes its values in the parameter space, as LLVM
+    // IR does).
     SmallVector<Argument *, 8> Kept, Trailing;
     SmallPtrSet<Argument *, 4> ByValue;
     for (Argument &A : Src->args()) {
@@ -590,7 +626,7 @@ struct GPUCanonicalizer : ValueMaterializer {
       auto *PT = dyn_cast<PointerType>(A.getType());
       (PT && PT->getAddressSpace() == AIRThreadgroup ? Trailing : Kept)
           .push_back(&A);
-      if (Kernel && !PT && A.getType()->isFirstClassType() &&
+      if (Kernel && !NVPTX && !PT && A.getType()->isFirstClassType() &&
           !A.getType()->isStructTy() && !A.hasByValAttr())
         ByValue.insert(&A);
     }
@@ -784,6 +820,9 @@ struct GPUCanonicalizer : ValueMaterializer {
     // AGX.
     if (Name.starts_with("llvm.agx."))
       return lowerAGX(B, CI, Name.drop_front(strlen("llvm.agx.")), R);
+    // NVPTX.
+    if (Name.starts_with("llvm.nvvm."))
+      return lowerNVVM(B, CI, Name.drop_front(strlen("llvm.nvvm.")), R);
 
     if (!Name.consume_front("air."))
       return false;
@@ -896,6 +935,54 @@ struct GPUCanonicalizer : ValueMaterializer {
       R = convergent(B, Base, CI.getType(), Args);
       if (CI.getType()->isVoidTy())
         R = nullptr;
+      return true;
+    }
+    return false;
+  }
+
+  /// NVPTX's intrinsics: the special registers (PTX ISA, "Special
+  /// Registers": %tid, %ntid, %ctaid, %nctaid; a warp is 32 consecutive
+  /// threads of the CTA, %laneid the thread's index in it), barriers and
+  /// memory fences. Others stay unknown calls.
+  bool lowerNVVM(IRBuilder<> &B, CallInst &CI, StringRef Name, Value *&R) {
+    Type *Ty = CI.getType();
+    if (Name.consume_front("read.ptx.sreg.")) {
+      StringRef Role = StringSwitch<StringRef>(Name.drop_back(2))
+        .Case("tid", "thread_position_in_threadgroup")
+        .Case("ntid", "threads_per_threadgroup")
+        .Case("ctaid", "threadgroup_position_in_grid")
+        .Case("nctaid", "threadgroups_per_grid")
+        .Default("");
+      if (!Role.empty() && Name.size() >= 2 && Name[Name.size() - 2] == '.' &&
+          Ty->isIntegerTy()) {
+        if (size_t C = StringRef("xyz").find(Name.back()); C != StringRef::npos) {
+          R = B.CreateZExtOrTrunc(systemValue(B, Role)[C], Ty);
+          return true;
+        }
+      }
+      if (Name == "laneid" && Ty->isIntegerTy()) {
+        R = B.CreateZExtOrTrunc(systemValue(B, "thread_index_in_simdgroup")[0],
+                                Ty);
+        return true;
+      }
+      if (Name == "warpsize" && Ty->isIntegerTy()) {
+        R = ConstantInt::get(Ty, 32);
+        return true;
+      }
+      return false;
+    }
+    // bar.sync / barrier.sync of the whole CTA (barrier0, barrier.sync(id),
+    // barrier.cta.sync[.aligned].all(id)): every thread waits, and memory is
+    // ordered across it.
+    if (Name == "barrier0" || Name == "barrier.sync" ||
+        Name == "bar.sync" ||
+        (Name.starts_with("barrier.cta.sync") && Name.ends_with(".all"))) {
+      barrier(B, true);
+      return true;
+    }
+    if (Name.starts_with("membar.") || Name.starts_with("fence.sc.") ||
+        Name.starts_with("fence.acq_rel.")) {
+      fence(B);
       return true;
     }
     return false;
@@ -1469,6 +1556,7 @@ struct GPUCanonicalizer : ValueMaterializer {
 bool is_gpu_module(const Module &M) {
   StringRef T(M.getTargetTriple().str());
   if (T.starts_with("agx") || T.starts_with("air") ||
+      T.starts_with("nvptx") ||
       M.getNamedMetadata("air.kernel"))
     return true;
   for (const Function &F : M) {
@@ -1477,6 +1565,8 @@ bool is_gpu_module(const Module &M) {
         !opencl_builtin(N).empty() ||
         F.getCallingConv() == CallingConv::SPIR_KERNEL ||
         F.getCallingConv() == AGXKernelCC ||
+        F.getCallingConv() == CallingConv::PTX_Kernel ||
+        N.starts_with("llvm.nvvm.") ||
         F.hasFnAttribute("air-kernel"))
       return true;
   }
