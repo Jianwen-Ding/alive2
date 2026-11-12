@@ -58,12 +58,12 @@ mutate() {  # mutate NAME KERNEL FUNCTION SED [alive-tv options]
     "$here/$kernel.ll" "$@"
 }
 mutate condition guarded guarded 's/setp.ge.s32/setp.gt.s32/'
-mutate immediate guarded guarded 's/xor.b32\t\(%r[0-9]*\), \(%r[0-9]*\), 255/xor.b32\t\1, \2, 254/'
-mutate scale guarded guarded 's/mul.wide.s32\t\(%rd[0-9]*\), \(%r[0-9]*\), 4/mul.wide.s32\t\1, \2, 8/'
+mutate immediate guarded guarded 's/\(xor.b32[ \t]*%r[0-9]*, %r[0-9]*\), 255/\1, 254/'
+mutate scale guarded guarded 's/\(mul.wide.s32[ \t]*%rd[0-9]*, %r[0-9]*\), 4/\1, 8/'
 mutate index-sign guarded guarded 's/mul.wide.s32/mul.wide.u32/'
 mutate buffer guarded guarded 's/\[guarded_param_1\]/[guarded_param_0]/'
 mutate barrier shared shared '/bar.sync/d'
-mutate mirror shared shared 's/sub.s32\t\(%r[0-9]*\), 255,/sub.s32\t\1, 254,/'
+mutate mirror shared shared 's/\(sub.s32[ \t]*%r[0-9]*\), 255,/\1, 254,/'
 mutate shift-sign bits shifts 's/shr.u32/shr.s32/'
 mutate min-sign bits counts 's/min.s32/min.u32/'
 mutate param-sign bits counts 's/ld.param.s16/ld.param.b16/'
@@ -72,7 +72,7 @@ mutate narrow-store bits narrow 's/st.global.b16/st.global.b32/'
 mutate select-sign bits dev 's/setp.gt.u32/setp.gt.s32/'
 mutate fadd float fma_like 's/add.rn.f32/sub.rn.f32/'
 mutate fmul float scale 's/mul.rn.f32/add.rn.f32/'
-mutate loop-step loop loop 's/add.s32\t\(%r[0-9]*\), \1, 1;/add.s32\t\1, \1, 2;/' "${unroll[@]}"
+mutate loop-step loop loop 's/\(add.s32[ \t]*\(%r[0-9]*\), \2\), 1;/\1, 2;/' "${unroll[@]}"
 wait
 
 fail=0

@@ -241,13 +241,12 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
         convertUsersOfConstantsToInstructions(Casts, Src, false, true);
     }
 
-    // The dynamic threadgroup memory F uses (AGX).
+    // The dynamic threadgroup memory F uses (AGX's).
     GlobalVariable *DynTG = Target.dynamicThreadgroupMemory(*Src);
 
     // Parameters: the others in order, then the threadgroup buffers. A
-    // kernel takes a value as AIR passes it, in a constant buffer (not an
-    // NVPTX kernel: PTX passes its values in the parameter space, as LLVM
-    // IR does).
+    // kernel of a target that says so takes a value as AIR passes it, in a
+    // constant buffer (GPUTarget::scalarsInConstantBuffers).
     SmallVector<Argument *, 8> Kept, Trailing;
     SmallPtrSet<Argument *, 4> ByValue;
     for (Argument &A : Src->args()) {
@@ -256,8 +255,9 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
       auto *PT = dyn_cast<PointerType>(A.getType());
       (PT && PT->getAddressSpace() == ThreadgroupAS ? Trailing : Kept)
           .push_back(&A);
-      if (Kernel && Target.scalarsInConstantBuffers() && !PT && A.getType()->isFirstClassType() &&
-          !A.getType()->isStructTy() && !A.hasByValAttr())
+      if (Kernel && Target.scalarsInConstantBuffers() && !PT &&
+          A.getType()->isFirstClassType() && !A.getType()->isStructTy() &&
+          !A.hasByValAttr())
         ByValue.insert(&A);
     }
     SmallVector<Type *, 8> Params;
@@ -408,11 +408,11 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
   // -------------------------------------------------------------------------
   // The floating-point environment.
 
-  /// AIR and AGX have no floating-point environment to change: outside
-  /// strictfp functions it rounds to nearest even and raises nothing, so a
-  /// constrained operation that rounds to nearest (or dynamically) and
-  /// ignores exceptions is the plain operation (agx-lower-air restores AIR's
-  /// software arithmetic as such operations).
+  /// The GPUs (AIR, AGX, PTX) have no floating-point environment to change:
+  /// outside strictfp functions it rounds to nearest even and raises
+  /// nothing, so a constrained operation that rounds to nearest (or
+  /// dynamically) and ignores exceptions is the plain operation
+  /// (agx-lower-air restores AIR's software arithmetic as such operations).
   void defaultFPEnvironment(Function &Fn) {
     if (Fn.hasFnAttribute(Attribute::StrictFP))
       return;

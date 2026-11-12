@@ -425,6 +425,9 @@ The meaning of PTX's instructions is a formalization of the PTX ISA,
 in SMT-LIB's bit-vector and float words, that the lifter interprets
 (`ptx_formal.py`). See `scripts/ptx-tv/README.md`.
 
+`tests/alive-tv/gpu/opencl-nvptx*` compare an OpenCL kernel (upstream GPU IR)
+with its NVPTX IR: one canonical form for both targets.
+
 
 Running the Standalone LLVM Execution Tool (alive-exec)
 -------------------------------------------------------

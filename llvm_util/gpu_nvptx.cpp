@@ -38,7 +38,8 @@ struct NVPTXLowering : GPULowering {
         .Default("");
       if (!Role.empty() && Name.size() >= 2 && Name[Name.size() - 2] == '.' &&
           Ty->isIntegerTy()) {
-        if (size_t C = StringRef("xyz").find(Name.back()); C != StringRef::npos) {
+        size_t C = StringRef("xyz").find(Name.back());
+        if (C != StringRef::npos) {
           R = B.CreateZExtOrTrunc(systemValue(B, Role)[C], Ty);
           return true;
         }
