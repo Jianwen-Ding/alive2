@@ -363,6 +363,17 @@ public:
   virtual void kernelRoles(const Function &Fn,
                            SmallVectorImpl<string> &Roles) const {}
 
+  /// Whether a cast from address space From to To has no meaning (its
+  /// result is poison): the canonical form has one address space, where it
+  /// would be no cast.
+  virtual bool castIsPoison(unsigned From, unsigned To) const {
+    return false;
+  }
+
+  /// The address space of memory private to a thread (NVPTX's local, AGX's
+  /// private), if the target has one: atomics there need no ordering.
+  virtual optional<unsigned> privateAddressSpace() const { return nullopt; }
+
   /// Whether the canonical form of this target's kernels takes a scalar
   /// parameter in a constant buffer (a pointer to it), as AIR passes it.
   virtual bool scalarsInConstantBuffers() const { return true; }

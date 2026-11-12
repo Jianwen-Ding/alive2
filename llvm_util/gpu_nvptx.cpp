@@ -157,6 +157,14 @@ public:
     }
   }
 
+  optional<unsigned> privateAddressSpace() const override { return 5; }
+
+  /// Between two specific (not generic) address spaces there is no cast:
+  /// the backend makes its result undefined.
+  bool castIsPoison(unsigned From, unsigned To) const override {
+    return From != To && From != 0 && To != 0;
+  }
+
   /// PTX passes a kernel's values in the parameter space, as LLVM IR does.
   bool scalarsInConstantBuffers() const override { return false; }
 

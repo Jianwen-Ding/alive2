@@ -131,6 +131,8 @@ public:
     return Fn.getCallingConv() == AGXKernelCC;
   }
 
+  optional<unsigned> privateAddressSpace() const override { return 5; }
+
   /// AGX's dynamic threadgroup memory: a zero-sized threadgroup variable
   /// without a definition.
   static bool isDynamicThreadgroupMemory(const GlobalVariable &G) {

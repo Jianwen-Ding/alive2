@@ -594,6 +594,8 @@ class Lifter:
   def lift(self):
     self.ptr = self.analyze_pointers()
     self.fregs = self.float_registers()
+    self.has_cas = any(k == 'instr' and x.base == 'atom' and x.has('cas')
+                       for k, x in self.body)
     out = []
     params = ', '.join(lifted_param(p) for p in self.params)
     out.append('define %s%s @%s(%s)%s {' % (self.cc, self.ret, self.name,
@@ -987,7 +989,7 @@ class Lifter:
         self.write_reg(d, self.freeze(v, 'ptr'), 'ptr')
         continue
       v = self.t('ld')
-      if bits > 8 and not self.order and d not in self.fregs:
+      if bits > 8 and self.order != 'volatile' and d not in self.fregs:
         # Memory holds bytes: a byte that is poison in the IR is some value
         # in memory, and the others are what they are (an integer load of a
         # poison byte would be all poison).
@@ -997,9 +999,11 @@ class Lifter:
       else:
         self.emit('%s = %s' % (v, self.load_text('i%d' % bits, a, al)))
         v = self.freeze(v, 'i%d' % bits)
-        if self.order in ('monotonic', 'volatile') and space != 'const':
-          # The bits read are in memory: a later read sees them too.
-          self.emit('store i%d %s, ptr %s, align %d' % (bits, v, a, al))
+      if (self.order in ('monotonic', 'volatile') and space != 'const' and
+          self.has_cas):
+        # The bits read are in memory: the CAS that follows sees them too
+        # (only where there is a CAS: the location may be read-only).
+        self.emit('store i%d %s, ptr %s, align %d' % (bits, v, a, al))
       if d == '_':
         continue
       rb = self.reg(d)

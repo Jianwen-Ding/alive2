@@ -241,6 +241,36 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
         convertUsersOfConstantsToInstructions(Casts, Src, false, true);
     }
 
+    // Casts between address spaces that have no meaning.
+    for (Instruction &I : make_early_inc_range(instructions(*Src)))
+      if (auto *C = dyn_cast<AddrSpaceCastInst>(&I);
+          C && Target.castIsPoison(C->getSrcAddressSpace(),
+                                   C->getDestAddressSpace())) {
+        C->replaceAllUsesWith(PoisonValue::get(C->getType()));
+        C->eraseFromParent();
+      }
+
+    // Atomics on memory private to the thread are of the thread alone (the
+    // address spaces are gone below).
+    if (optional<unsigned> Private = Target.privateAddressSpace())
+      for (Instruction &I : instructions(*Src)) {
+        Value *P = getLoadStorePointerOperand(&I);
+        if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
+          P = RMW->getPointerOperand();
+        if (auto *X = dyn_cast<AtomicCmpXchgInst>(&I))
+          P = X->getPointerOperand();
+        if (!P || P->getType()->getPointerAddressSpace() != *Private)
+          continue;
+        if (auto *L = dyn_cast<LoadInst>(&I); L && L->isAtomic())
+          L->setSyncScopeID(SyncScope::SingleThread);
+        if (auto *S = dyn_cast<StoreInst>(&I); S && S->isAtomic())
+          S->setSyncScopeID(SyncScope::SingleThread);
+        if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
+          RMW->setSyncScopeID(SyncScope::SingleThread);
+        if (auto *X = dyn_cast<AtomicCmpXchgInst>(&I))
+          X->setSyncScopeID(SyncScope::SingleThread);
+      }
+
     // The dynamic threadgroup memory F uses (AGX's).
     SmallVector<GlobalVariable *, 2> DynTGs;
     Target.dynamicThreadgroupMemory(*Src, DynTGs);
@@ -503,6 +533,16 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
         if (Fe->getSyncScopeID() != SyncScope::SingleThread)
           fence(B);
         I->eraseFromParent();
+      } else if (auto *L = dyn_cast<LoadInst>(I);
+                 L && L->isAtomic() &&
+                 L->getSyncScopeID() == SyncScope::SingleThread) {
+        L->setAtomic(AtomicOrdering::NotAtomic);
+        L->setVolatile(false);
+      } else if (auto *S = dyn_cast<StoreInst>(I);
+                 S && S->isAtomic() &&
+                 S->getSyncScopeID() == SyncScope::SingleThread) {
+        S->setAtomic(AtomicOrdering::NotAtomic);
+        S->setVolatile(false);
       } else if (auto *L = dyn_cast<LoadInst>(I)) {
         // An acquire load is the load, then what other threads did; a
         // sequentially consistent one is also after what they did.
@@ -513,10 +553,10 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
         L->setAtomic(AtomicOrdering::NotAtomic);
         L->setVolatile(false);
       } else if (auto *S = dyn_cast<StoreInst>(I)) {
+        // A release or sequentially consistent store is what other threads
+        // did, then the store (PTX: fence.sc, then the store).
         if (ordered(S->getOrdering()))
           fence(B);
-        if (S->getOrdering() == AtomicOrdering::SequentiallyConsistent)
-          after();
         S->setAtomic(AtomicOrdering::NotAtomic);
         S->setVolatile(false);
       } else if (auto *RMW = dyn_cast<AtomicRMWInst>(I)) {
