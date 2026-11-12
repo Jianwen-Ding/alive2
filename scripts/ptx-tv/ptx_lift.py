@@ -989,7 +989,7 @@ class Lifter:
         self.write_reg(d, self.freeze(v, 'ptr'), 'ptr')
         continue
       v = self.t('ld')
-      if bits > 8 and self.order != 'volatile' and d not in self.fregs:
+      if bits > 8 and d not in self.fregs:
         # Memory holds bytes: a byte that is poison in the IR is some value
         # in memory, and the others are what they are (an integer load of a
         # poison byte would be all poison).
@@ -1146,9 +1146,10 @@ class Lifter:
     # byte that is poison in the IR is some value there), and writes what
     # the operation makes of them (a CAS that fails writes back what it read:
     # no matter in a sequential model, and two reads then agree).
-    ordered = order != 'monotonic'
-    if ordered:
-      self.emit('fence acq_rel')
+    release = order in ('release', 'acq_rel', 'seq_cst')
+    acquire = order in ('acquire', 'acq_rel', 'seq_cst')
+    if release:
+      self.emit('fence release')
     old = self.read_bits(p, bits)
     if kind in ('f', 'bf'):
       if op not in ('add', 'min', 'max'):
@@ -1170,11 +1171,19 @@ class Lifter:
       if ftz:
         new = self.flush32(new)
     elif op == 'cas':
+      # Writes only when it finds the expected value (the location may be
+      # read-only).
       c = self.operand(ops[1], bits)
       v = self.operand(ops[2], bits)
-      eq, new = self.t(), self.t()
+      eq = self.t()
       self.emit('%s = icmp eq %s %s, %s' % (eq, T, old, c))
-      self.emit('%s = select i1 %s, %s %s, %s %s' % (new, eq, T, v, T, old))
+      st, done = self.t('cas.st')[1:], self.t('cas.done')[1:]
+      self.emit('br i1 %s, label %%%s, label %%%s' % (eq, st, done))
+      self.lines.append('%s:' % st)
+      self.emit('store %s %s, ptr %s, align %d' % (T, v, p, bits // 8))
+      self.emit('br label %%%s' % done)
+      self.lines.append('%s:' % done)
+      new = None
     else:
       v = self.operand(ops[1], bits)
       new = self.t()
@@ -1201,9 +1210,10 @@ class Lifter:
         self.emit('%s = select i1 %s, %s %s, %s %s' % (new, o, T, v, T, dec))
       else:
         raise LiftError('atomic not lifted: ' + str(x))
-    self.emit('store %s %s, ptr %s, align %d' % (T, new, p, bits // 8))
-    if ordered:
-      self.emit('fence acq_rel')
+    if new is not None:
+      self.emit('store %s %s, ptr %s, align %d' % (T, new, p, bits // 8))
+    if acquire:
+      self.emit('fence acquire')
     if not red:
       self.write_reg(x.operands[0], old, T)
 

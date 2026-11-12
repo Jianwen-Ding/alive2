@@ -597,7 +597,10 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
 
   /// atomicrmw as load, operation, store; an ordered one between fences.
   Value *sequentialRMW(IRBuilder<> &B, AtomicRMWInst &RMW) {
-    bool Ordered = isStrongerThanMonotonic(RMW.getOrdering());
+    // Release: what this thread did is done first; acquire: what others did
+    // is seen after.
+    bool Release = isReleaseOrStronger(RMW.getOrdering());
+    bool Acquire = isAcquireOrStronger(RMW.getOrdering());
     Type *Ty = RMW.getType();
     Value *Ptr = RMW.getPointerOperand(), *V = RMW.getValOperand();
     // Check the operation first, so that nothing is emitted for one this
@@ -615,7 +618,7 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
     default:
       return nullptr;
     }
-    if (Ordered)
+    if (Release)
       fence(B);
     LoadInst *Old = B.CreateAlignedLoad(Ty, Ptr, RMW.getAlign());
     Value *New = nullptr;
@@ -653,7 +656,7 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
       llvm_unreachable("checked above");
     }
     B.CreateAlignedStore(New, Ptr, RMW.getAlign());
-    if (Ordered)
+    if (Acquire)
       fence(B);
     return Old;
   }
@@ -662,9 +665,10 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
   /// anyway.
   void sequentialCmpXchg(AtomicCmpXchgInst &X) {
     IRBuilder<> B(&X);
-    bool Ordered = isStrongerThanMonotonic(X.getSuccessOrdering()) ||
-                   isStrongerThanMonotonic(X.getFailureOrdering());
-    if (Ordered)
+    bool Release = isReleaseOrStronger(X.getSuccessOrdering());
+    bool Acquire = isAcquireOrStronger(X.getSuccessOrdering()) ||
+                   isAcquireOrStronger(X.getFailureOrdering());
+    if (Release)
       fence(B);
     Type *Ty = X.getCompareOperand()->getType();
     Value *Ptr = X.getPointerOperand();
@@ -678,7 +682,7 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
     B.SetInsertPoint(&X);
     Value *R = B.CreateInsertValue(PoisonValue::get(X.getType()), Old, 0);
     R = B.CreateInsertValue(R, Eq, 1);
-    if (Ordered)
+    if (Acquire)
       fence(B);
     R->takeName(&X);
     X.replaceAllUsesWith(R);
