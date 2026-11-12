@@ -195,11 +195,20 @@ if (BUILD_LLVM_UTILS OR BUILD_TV)
     "llvm_util/gpu_air.cpp"
     "llvm_util/gpu_nvptx.cpp"
     "llvm_util/gpu_upstream.cpp"
+    "llvm_util/ptx_formal.cpp"
     "llvm_util/known_fns.cpp"
     "llvm_util/llvm_optimizer.cpp"
     "llvm_util/llvm2alive.cpp"
     "llvm_util/utils.cpp"
   )
+
+  # The PTX formalization, built into the NVPTX target's semantics
+  # (llvm_util/ptx_formal.h); ptx-tv reads the same file.
+  set(PTX_FORMAL "${PROJECT_SOURCE_DIR}/scripts/ptx-tv/ptx.formal")
+  file(READ "${PTX_FORMAL}" PTX_FORMAL_TEXT)
+  file(WRITE "${PROJECT_BINARY_DIR}/ptx_formal_text.inc"
+       "R\"PTXFORMAL(${PTX_FORMAL_TEXT})PTXFORMAL\"\n")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PTX_FORMAL}")
 
   add_library(llvm_util STATIC ${LLVM_UTIL_SRCS})
   set(ALIVE_LIBS_LLVM llvm_util ${ALIVE_LIBS})

@@ -1,7 +1,8 @@
 ; The semantics of PTX instructions, per thread, after NVIDIA's PTX ISA
 ; ("Parallel Thread Execution ISA", chapter "Instruction Set"): what
 ; ptx_lift.py makes of the arithmetic, logic, comparison and conversion
-; instructions. The lifter keeps the machine (registers, the parameter
+; instructions, and what alive2 makes of the NVVM intrinsics that stand for
+; one of them (llvm_util/ptx_formal.cpp, which builds this file in). The lifter keeps the machine (registers, the parameter
 ; space, memory, control flow, pointers) and reads each other instruction's
 ; meaning from here, so that this file is the whole account of what they
 ; compute, readable next to the ISA and independent of the NVPTX backend's

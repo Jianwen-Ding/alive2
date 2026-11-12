@@ -38,8 +38,14 @@ section and wording beside it:
   (set d (fp.to-int-sat D a)))
 ```
 
-The format is described at the top of `ptx.formal`; `ptx_formal.py` reads
-it and interprets an entry as LLVM IR. It holds the integer and float
+The format is described at the top of `ptx.formal`. It has two
+interpreters, which emit an entry's meaning as LLVM IR: `ptx_formal.py`, for
+the lifter, and alive2's `llvm_util/ptx_formal.cpp`, built into alive-tv and
+the `tv` plugin (CMake embeds the file), which the NVPTX target
+(`llvm_util/gpu_nvptx.cpp`) uses for the NVVM intrinsics that stand for one
+PTX instruction (`llvm.nvvm.f2i.rz`: `cvt.rzi.s32.f32`). A kernel that calls
+such an intrinsic is checked against its PTX with both sides' meaning from
+the same entry (`tests/intrinsics.ll`). It holds the integer and float
 arithmetic, logic, shifts, bit-field and permute instructions, comparisons,
 selection and conversions: an instruction no entry matches (a modifier such
 as `.ftz` or `.sat` that the entries do not have) is not lifted, so the file
@@ -100,11 +106,12 @@ several float operations, may need `-smt-to` in minutes.
 The tests
 ---------
 
-`tests/run.sh` checks that six kernels' PTX verifies (a guarded store with
+`tests/run.sh` checks that seven kernels' PTX verifies (a guarded store with
 the global thread index, shared memory with a barrier, a loop, vector
 accesses with an atomic, integer bit operations and narrow integers, a
-device function, float arithmetic), and that seeded mistakes in their PTX
-are rejected: a comparison, an immediate, an index scale and its sign, the
-wrong buffer, a missing barrier, a shift's and a minimum's signedness, a
-parameter's sign extension, a count, a store's width, float operations and
-a loop's step.
+device function, float arithmetic, NVVM intrinsics), and that seeded
+mistakes in their PTX are rejected: a comparison, an immediate, an index
+scale and its sign, the wrong buffer, a missing barrier, a shift's and a
+minimum's signedness, a parameter's sign extension, a count, a store's
+width, float operations, a conversion's rounding, a permutation's selector
+and a loop's step.

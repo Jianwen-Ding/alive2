@@ -422,11 +422,19 @@ $ scripts/ptx-tv/ptx-tv --keep dir --ptx edited.ptx --func k kernel.ll
 
 The meaning of PTX's instructions is a formalization of the PTX ISA,
 `scripts/ptx-tv/ptx.formal`: one declarative entry per instruction family,
-in SMT-LIB's bit-vector and float words, that the lifter interprets
-(`ptx_formal.py`). See `scripts/ptx-tv/README.md`.
+in SMT-LIB's bit-vector and float words. Both sides of a check read it:
+ptx-tv's lifter interprets it for the PTX (`ptx_formal.py`), and alive2's
+NVPTX target, which builds it in (`llvm_util/ptx_formal.cpp`), for the NVVM
+intrinsics that stand for one PTX instruction: `llvm.nvvm.f2i.rz` is
+`cvt.rzi.s32.f32`, `llvm.nvvm.prmt` `prmt.b32`, `llvm.nvvm.div.rn.f`
+`div.rn.f32`, and so on for the integer/float conversions, `mulhi`, `fmin` /
+`fmax`, `rcp`, `sqrt`, `add`, `mul` and `fma` with a rounding. An intrinsic
+whose instruction has no entry (`.ftz`, the directed roundings) stays an
+unknown call. See `scripts/ptx-tv/README.md`.
 
 `tests/alive-tv/gpu/opencl-nvptx*` compare an OpenCL kernel (upstream GPU IR)
-with its NVPTX IR: one canonical form for both targets.
+with its NVPTX IR: one canonical form for both targets; `nvvm-*` check NVVM
+intrinsics, by the formalization, against the LLVM operations they are.
 
 
 Running the Standalone LLVM Execution Tool (alive-exec)

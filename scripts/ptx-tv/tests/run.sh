@@ -40,6 +40,8 @@ expect correct "shared verifies" --keep "$tmp/shared" "$here/shared.ll"
 expect correct "vec verifies" --keep "$tmp/vec" "$here/vec.ll"
 expect correct "bits verifies" --keep "$tmp/bits" "$here/bits.ll"
 expect correct "float verifies" --keep "$tmp/float" "$here/float.ll"
+expect correct "intrinsics verify" --keep "$tmp/intrinsics" \
+  "$here/intrinsics.ll"
 # alive2 checks loops unrolled to a bound.
 unroll=(-src-unroll=2 -tgt-unroll=2 -smt-to=300000)
 expect correct "loop verifies (two iterations)" --keep "$tmp/loop" \
@@ -72,6 +74,8 @@ mutate narrow-store bits narrow 's/st.global.b16/st.global.b32/'
 mutate select-sign bits dev 's/setp.gt.u32/setp.gt.s32/'
 mutate fadd float fma_like 's/add.rn.f32/sub.rn.f32/'
 mutate fmul float scale 's/mul.rn.f32/add.rn.f32/'
+mutate cvt-rounding intrinsics cvt 's/cvt.rzi.s32.f32/cvt.rni.s32.f32/'
+mutate prmt-selector intrinsics prmt 's/0x1076U/0x1067U/'
 mutate loop-step loop loop 's/\(add.s32[ \t]*\(%r[0-9]*\), \2\), 1;/\1, 2;/' "${unroll[@]}"
 wait
 

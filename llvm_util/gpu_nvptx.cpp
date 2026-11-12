@@ -5,9 +5,12 @@
 // ptx_kernel kernels, address spaces global 1, shared 3, const 4 and local 5,
 // and llvm.nvvm.* intrinsics. PTX itself (what the backend prints) is lifted
 // to this form by scripts/ptx-tv, after the PTX ISA's semantics
-// (scripts/ptx-tv/ptx.formal).
+// (scripts/ptx-tv/ptx.formal), which this target also gives the NVVM
+// intrinsics that stand for one PTX instruction (ptx_formal.h).
 
 #include "llvm_util/gpu_target.h"
+#include "llvm_util/ptx_formal.h"
+#include "util/config.h"
 #include "llvm/ADT/StringSwitch.h"
 
 namespace llvm_util {
@@ -69,7 +72,43 @@ struct NVPTXLowering : GPULowering {
       fence(B);
       return true;
     }
-    return false;
+    return lowerPTXInstruction(B, CI, Name, R);
+  }
+
+  /// An intrinsic that stands for one PTX instruction (llvm.nvvm.f2i.rz:
+  /// cvt.rzi.s32.f32, llvm.nvvm.prmt: prmt.b32, ...): the instruction's
+  /// meaning in the PTX formalization (scripts/ptx-tv/ptx.formal, built in),
+  /// the same that ptx-tv lifts PTX by.
+  bool lowerPTXInstruction(IRBuilder<> &B, CallInst &CI, StringRef Name,
+                           Value *&R) {
+    string Op = ptx_instruction_of_nvvm(Name);
+    Type *Ty = CI.getType();
+    if (Op.empty() || !(Ty->isIntegerTy() || Ty->isFloatingPointTy()))
+      return false;
+    SmallVector<Value *, 4> Bits;
+    for (Value *A : CI.args()) {
+      Type *T = A->getType();
+      if (T->isFloatingPointTy())
+        A = B.CreateBitCast(A, B.getIntNTy(T->getPrimitiveSizeInBits()));
+      else if (!T->isIntegerTy())
+        return false;
+      Bits.push_back(A);
+    }
+    string Err;
+    Value *V = PTXFormal::builtin().lift(B, Op, Bits, Err);
+    if (!Err.empty())
+      util::config::dbg() << "ERROR: " << Err << '\n';
+    if (!V)
+      return false;
+    unsigned W = V->getType()->getIntegerBitWidth();
+    if (Ty->isFloatingPointTy()) {
+      if (Ty->getPrimitiveSizeInBits() != W)
+        return false;
+      R = B.CreateBitCast(V, Ty);
+    } else {
+      R = B.CreateZExtOrTrunc(V, Ty);
+    }
+    return true;
   }
 
 };
