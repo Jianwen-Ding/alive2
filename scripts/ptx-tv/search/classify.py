@@ -61,7 +61,8 @@ def classify(r):
     return 'ordered-cas-loop-unproven'
   # A byval argument whose address escapes: NVPTX copies it to the stack
   # and escapes the copy's (both dangle after the return).
-  if 'byval(' in src and re.search(r'Target value: pointer\(local', out):
+  if 'byval(' in src and (re.search(r'Target value: pointer\(local', out) or
+                          '__local_depot' in ptx):
     return 'byval-escape-copy'
   # NaN payloads.
   if re.search(r'(Source|Target) value: .*NaN', out):
