@@ -29,8 +29,8 @@ but passes it one byte per element, at offsets 0 to N-1: every access but
 the first is past the `.param` it is declared as. ptx-tv rejects both
 functions (`third`: target more poisonous than source, its element read
 from beyond its parameter; `caller`: source more defined than target, its
-stores beyond the argument's bytes). ptxas accepts the PTX (the test runs
-`%ptxas-verify`); what the GPU does with the bytes past a parameter is not
+stores beyond the argument's bytes). What the GPU does with the bytes past
+a parameter is not
 PTX's to say. The declaration and the accesses should agree: declare
 `N` bytes (`.b8 param0[4]`), or pack the elements into the one byte.
 
