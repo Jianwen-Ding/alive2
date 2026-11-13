@@ -370,6 +370,11 @@ public:
     return false;
   }
 
+  /// Whether the target inlines the functions a kernel calls (AGX does): the
+  /// canonical form then inlines those the module defines. Otherwise calls
+  /// stay calls, the same unknown function on both sides.
+  virtual bool inlinesCalls() const { return true; }
+
   /// The address space of memory private to a thread (NVPTX's local, AGX's
   /// private), if the target has one: atomics there need no ordering.
   virtual optional<unsigned> privateAddressSpace() const { return nullopt; }

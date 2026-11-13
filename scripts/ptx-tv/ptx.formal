@@ -47,8 +47,16 @@
 ;   (if-signed X Y) by T's signedness, (has m);
 ; and floats, the bits of an IEEE binary16/32/64 by width (bf16: (as-bf16)):
 ;   (fp.add X Y) fp.sub fp.mul fp.div (fp.fma X Y Z) fp.sqrt fp.neg fp.abs
-;   fp.minnum fp.maxnum (fp.copysign MAG SIGN) fp.roundeven fp.trunc
-;   fp.floor fp.ceil, each rounding to nearest even;
+;   fp.minnum fp.maxnum fp.minimumnum fp.maximumnum fp.minimum fp.maximum
+;   (fp.copysign MAG SIGN) fp.roundeven fp.trunc fp.floor fp.ceil, each
+;   rounding to nearest even (LLVM's intrinsics of those names);
+;   (fp.rounded RND OP X ...): OP (fp.add fp.sub fp.mul fp.div fp.fma
+;     fp.sqrt fp.narrow fp.from-sint fp.from-uint) rounding as RND (a name
+;     (one RND ...) bound, or rn rz rm rp) says;
+;   (fp.ftz X): a subnormal X flushed to the zero of its sign; (fp.sat X):
+;     X clamped to [0, 1], NaN to 0; (fp.relu X): a negative X 0, a NaN the
+;     canonical NaN;
+;   statically, (if-has m X Y): X if the opcode has the optional part m;
 ;   (fp.contract OP X Y): OP, which ptxas may fuse with a neighbouring
 ;     operation (add, sub and mul without a rounding modifier);
 ;   (fcmp PRED X Y) with LLVM's predicates (oeq une ord uno ...);
@@ -229,11 +237,11 @@
                    (one BOP and or xor) $T:cmpint) (p:pred a b c:pred)
   (set p (bool-op BOP (int-compare CMP a b) c)))
 (instruction (setp (one CMP eq ne lt le gt ge equ neu ltu leu gtu geu num nan)
-                   $T:float) (p:pred a b)
-  (set p (float-compare CMP a b)))
+                   (opt ftz) $T:float) (p:pred a b)
+  (set p (float-compare CMP (ftz-in a) (ftz-in b))))
 (instruction (setp (one CMP eq ne lt le gt ge equ neu ltu leu gtu geu num nan)
-                   (one BOP and or xor) $T:float) (p:pred a b c:pred)
-  (set p (bool-op BOP (float-compare CMP a b) c)))
+                   (one BOP and or xor) (opt ftz) $T:float) (p:pred a b c:pred)
+  (set p (bool-op BOP (float-compare CMP (ftz-in a) (ftz-in b)) c)))
 
 ; 9.7.6.3 selp.
 (instruction (selp $T:any) (d a b c:pred) (set d (ite c a b)))
@@ -241,57 +249,84 @@
 ; ---------------------------------------------------------------------------
 ; Floating point (PTX ISA 9.7.3, 9.7.4). Without .ftz: subnormals are kept.
 
-; add, sub, mul: .rn rounds to nearest even; no modifier also allows ptxas
-; to contract them with a neighbouring operation into fma.
-(instruction (add rn $T:float) (d a b) (set d (fp.add a b)))
-(instruction (sub rn $T:float) (d a b) (set d (fp.sub a b)))
-(instruction (mul rn $T:float) (d a b) (set d (fp.mul a b)))
-(instruction (add $T:float) (d a b) (set d (fp.contract fp.add a b)))
-(instruction (sub $T:float) (d a b) (set d (fp.contract fp.sub a b)))
-(instruction (mul $T:float) (d a b) (set d (fp.contract fp.mul a b)))
+;; .ftz flushes subnormal inputs and results to zero of their sign; .sat
+;; clamps the result to [0, 1] (NaN to 0); .relu makes a negative result 0
+;; and a NaN the canonical NaN. The roundings: .rn to nearest even, .rz
+;; toward zero, .rm down, .rp up.
+(define (ftz-in x) (if-has ftz (fp.ftz x) x))
+(define (flushed x) (if-has ftz (fp.ftz x) x))
+(define (result x)
+  (if-has sat (fp.sat (flushed x)) (if-has relu (fp.relu (flushed x)) (flushed x))))
+
+; add, sub, mul with a rounding; without one, ptxas may also contract them
+; with a neighbouring operation into fma.
+(instruction (add (one RND rn rz rm rp) (opt ftz) (opt sat) $T:float) (d a b)
+  (set d (result (fp.rounded RND fp.add (ftz-in a) (ftz-in b)))))
+(instruction (sub (one RND rn rz rm rp) (opt ftz) (opt sat) $T:float) (d a b)
+  (set d (result (fp.rounded RND fp.sub (ftz-in a) (ftz-in b)))))
+(instruction (mul (one RND rn rz rm rp) (opt ftz) (opt sat) $T:float) (d a b)
+  (set d (result (fp.rounded RND fp.mul (ftz-in a) (ftz-in b)))))
+(instruction (add (opt ftz) (opt sat) $T:float) (d a b)
+  (set d (result (fp.contract fp.add (ftz-in a) (ftz-in b)))))
+(instruction (sub (opt ftz) (opt sat) $T:float) (d a b)
+  (set d (result (fp.contract fp.sub (ftz-in a) (ftz-in b)))))
+(instruction (mul (opt ftz) (opt sat) $T:float) (d a b)
+  (set d (result (fp.contract fp.mul (ftz-in a) (ftz-in b)))))
 
 ; fma and (on sm_20 and later) mad with a rounding: one rounding.
-(instruction ((one OP fma mad) rn $T:float) (d a b c) (set d (fp.fma a b c)))
+(instruction ((one OP fma mad) (one RND rn rz rm rp) (opt ftz) (opt sat)
+              (opt relu) $T:float) (d a b c)
+  (set d (result (fp.rounded RND fp.fma (ftz-in a) (ftz-in b) (ftz-in c)))))
 
-; div.rn, rcp.rn, sqrt.rn: IEEE, correctly rounded.
-(instruction (div rn $T:float) (d a b) (set d (fp.div a b)))
-(instruction (rcp rn $T:float) (d a) (set d (fp.div 1.0 a)))
-(instruction (sqrt rn $T:float) (d a) (set d (fp.sqrt a)))
+; div, rcp, sqrt with a rounding: IEEE, correctly rounded.
+(instruction (div (one RND rn rz rm rp) (opt ftz) $T:float) (d a b)
+  (set d (result (fp.rounded RND fp.div (ftz-in a) (ftz-in b)))))
+(instruction (rcp (one RND rn rz rm rp) (opt ftz) $T:float) (d a)
+  (set d (result (fp.rounded RND fp.div 1.0 (ftz-in a)))))
+(instruction (sqrt (one RND rn rz rm rp) (opt ftz) $T:float) (d a)
+  (set d (result (fp.rounded RND fp.sqrt (ftz-in a)))))
 
 ; neg, abs: the sign bit (NaNs too).
-(instruction (neg $T:float) (d a) (set d (fp.neg a)))
-(instruction (abs $T:float) (d a) (set d (fp.abs a)))
+(instruction (neg (opt ftz) $T:float) (d a) (set d (result (fp.neg (ftz-in a)))))
+(instruction (abs (opt ftz) $T:float) (d a) (set d (result (fp.abs (ftz-in a)))))
 
 ; min, max: "If one of the inputs is NaN, the other is returned"; both NaN:
-; NaN.
-(instruction (min $T:float) (d a b) (set d (fp.minnum a b)))
-(instruction (max $T:float) (d a b) (set d (fp.maxnum a b)))
+; NaN; "+0.0 > -0.0": IEEE 754-2019's minimumNumber and maximumNumber. With
+; .NaN, a NaN input gives the canonical NaN (minimum, maximum).
+(define (min-max op a b)
+  (if-has NaN
+    (case op (min (fp.minimum a b)) (max (fp.maximum a b)))
+    (case op (min (fp.minimumnum a b)) (max (fp.maximumnum a b)))))
+(instruction ((one OP min max) (opt ftz) (opt NaN) $T:float) (d a b)
+  (set d (result (min-max OP (ftz-in a) (ftz-in b)))))
+(instruction ((one OP min max) (opt ftz) (opt NaN) $T:float) (d a b c)
+  (set d (result (min-max OP (min-max OP (ftz-in a) (ftz-in b)) (ftz-in c)))))
 
 ; copysign d, a, b: b with a's sign.
 (instruction (copysign $T:float) (d a b) (set d (fp.copysign b a)))
 
 ; The approximations: uninterpreted, as the NVVM intrinsics that mean them.
-(instruction (rsqrt approx f32) (d a)
+(instruction (rsqrt approx $T:f32) (d a)
   (set d (uninterpreted "llvm.nvvm.rsqrt.approx.f" a)))
-(instruction (rsqrt approx ftz f32) (d a)
+(instruction (rsqrt approx ftz $T:f32) (d a)
   (set d (uninterpreted "llvm.nvvm.rsqrt.approx.ftz.f" a)))
-(instruction (rsqrt approx f64) (d a)
+(instruction (rsqrt approx $T:f64) (d a)
   (set d (uninterpreted "llvm.nvvm.rsqrt.approx.d" a)))
-(instruction (sqrt approx f32) (d a)
+(instruction (sqrt approx $T:f32) (d a)
   (set d (uninterpreted "llvm.nvvm.sqrt.approx.f" a)))
-(instruction (sqrt approx ftz f32) (d a)
+(instruction (sqrt approx ftz $T:f32) (d a)
   (set d (uninterpreted "llvm.nvvm.sqrt.approx.ftz.f" a)))
-(instruction (div approx f32) (d a b)
+(instruction (div approx $T:f32) (d a b)
   (set d (uninterpreted "llvm.nvvm.div.approx.f" a b)))
-(instruction (div approx ftz f32) (d a b)
+(instruction (div approx ftz $T:f32) (d a b)
   (set d (uninterpreted "llvm.nvvm.div.approx.ftz.f" a b)))
-(instruction (lg2 approx f32) (d a)
+(instruction (lg2 approx $T:f32) (d a)
   (set d (uninterpreted "llvm.nvvm.lg2.approx.f" a)))
-(instruction (lg2 approx ftz f32) (d a)
+(instruction (lg2 approx ftz $T:f32) (d a)
   (set d (uninterpreted "llvm.nvvm.lg2.approx.ftz.f" a)))
-(instruction (ex2 approx f32) (d a)
+(instruction (ex2 approx $T:f32) (d a)
   (set d (uninterpreted "llvm.nvvm.ex2.approx.f32" a)))
-(instruction (ex2 approx ftz f32) (d a)
+(instruction (ex2 approx ftz $T:f32) (d a)
   (set d (uninterpreted "llvm.nvvm.ex2.approx.ftz.f32" a)))
 
 ; ---------------------------------------------------------------------------
@@ -305,23 +340,23 @@
 
 (instruction (cvt $D:int $S:int) (d:D a:S)
   (set d (ext-by S a WD)))
-(instruction (cvt rzi $D:int $S:float) (d:D a:S)
-  (set d (fp.to-int-sat D a)))
-(instruction (cvt rni $D:int $S:float) (d:D a:S)
-  (set d (fp.to-int-sat D (fp.roundeven a))))
-(instruction (cvt rmi $D:int $S:float) (d:D a:S)
-  (set d (fp.to-int-sat D (fp.floor a))))
-(instruction (cvt rpi $D:int $S:float) (d:D a:S)
-  (set d (fp.to-int-sat D (fp.ceil a))))
-(instruction (cvt rn $D:float $S:sint) (d:D a:S)
-  (set d (fp.from-sint a WD)))
-(instruction (cvt rn $D:float $S:uint) (d:D a:S)
-  (set d (fp.from-uint a WD)))
-(instruction (cvt $D:float $S:float) (d:D a:S)
-  (set d (fp.extend a WD)))
-(instruction (cvt rn $D:float $S:float) (d:D a:S)
-  (set d (fp.narrow a WD)))
-(instruction (cvt rni $T:float $T:float) (d a) (set d (fp.roundeven a)))
-(instruction (cvt rzi $T:float $T:float) (d a) (set d (fp.trunc a)))
-(instruction (cvt rmi $T:float $T:float) (d a) (set d (fp.floor a)))
-(instruction (cvt rpi $T:float $T:float) (d a) (set d (fp.ceil a)))
+(define (round-integral rnd x)
+  (case rnd (rni (fp.roundeven x)) (rzi (fp.trunc x)) (rmi (fp.floor x))
+            (rpi (fp.ceil x))))
+(instruction (cvt (one RND rzi rni rmi rpi) (opt ftz) (opt sat) $D:int $S:float)
+             (d:D a:S)
+  (set d (fp.to-int-sat D (round-integral RND (ftz-in a)))))
+(instruction (cvt (one RND rn rz rm rp) $D:float $S:sint) (d:D a:S)
+  (set d (fp.rounded RND fp.from-sint a WD)))
+(instruction (cvt (one RND rn rz rm rp) $D:float $S:uint) (d:D a:S)
+  (set d (fp.rounded RND fp.from-uint a WD)))
+(instruction (cvt (opt ftz) (opt sat) $T:float $T:float) (d a)
+  (set d (result (ftz-in a))))
+(instruction (cvt (opt ftz) (opt sat) $D:float $S:float) (d:D a:S)
+  (set d (result (fp.extend (ftz-in a) WD))))
+(instruction (cvt (one RND rn rz rm rp) (opt ftz) (opt sat) $D:float $S:float)
+             (d:D a:S)
+  (set d (result (fp.rounded RND fp.narrow (ftz-in a) WD))))
+(instruction (cvt (one RND rni rzi rmi rpi) (opt ftz) (opt sat) $T:float $T:float)
+             (d a)
+  (set d (result (round-integral RND (ftz-in a)))))

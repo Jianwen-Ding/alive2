@@ -159,6 +159,9 @@ public:
 
   optional<unsigned> privateAddressSpace() const override { return 5; }
 
+  /// PTX has calls (call.uni): ptx-tv lifts them as calls.
+  bool inlinesCalls() const override { return false; }
+
   /// Between two specific (not generic) address spaces there is no cast:
   /// the backend makes its result undefined.
   bool castIsPoison(unsigned From, unsigned To) const override {

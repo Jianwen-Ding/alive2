@@ -183,6 +183,25 @@ def statements(body):
   return out
 
 
+class CallParam:
+  """A call site's .param declaration: bytes the call's arguments (or its
+  return value) are written in."""
+  base = '.param'
+  guard = None
+  operands = []
+  mods = ['.param']
+
+  def __init__(self, name, size):
+    self.name, self.size = name, size
+    self.text = '.param %s[%d]' % (name, size)
+
+  def has(self, *m):
+    return False
+
+  def __str__(self):
+    return self.text
+
+
 class Instr:
   def __init__(self, text):
     self.text = text
@@ -298,6 +317,7 @@ class Lifter:
       self.statement(s[1])
     self.lines = []
     self.decls = {}
+    self.attr_groups = {}
     self.tmp = 0
 
   # -- Declarations ---------------------------------------------------------
@@ -337,6 +357,14 @@ class Lifter:
       count = int(m.group(5)) if m.group(5) else 1
       size = TYPES[m.group(3)][1] // 8 * count
       self.locals[m.group(4)] = (m.group(1), size, int(m.group(2) or 1))
+      return
+    m = re.match(r'\.param\s+(?:\.align\s+(\d+)\s+)?\.(\w+)\s+([\w$]+)\s*'
+                 r'(?:\[(\d+)\])?\s*$', text)
+    if m and m.group(2) in TYPES:
+      # A call's parameter (or return value): bytes of the call site.
+      count = int(m.group(4)) if m.group(4) else 1
+      size = max(1, TYPES[m.group(2)][1] // 8) * count
+      self.body.append(('instr', CallParam(m.group(3), size)))
       return
     if text.startswith('.'):
       # .maxntid, .reqntid, .pragma, .loc, ...: nothing per thread.
@@ -611,6 +639,16 @@ class Lifter:
         out.append('  %s.init = freeze %s poison' % (self.slot(r), ty))
         out.append('  store %s %s.init, ptr %s' % (ty, self.slot(r),
                                                    self.slot(r)))
+    self.cparams = {}
+    self.cslots = []
+    for kind, x in self.body:
+      if kind == 'instr' and isinstance(x, CallParam):
+        x.slot = '%%CP.%d' % len(self.cslots)
+        self.cslots.append(x)
+        out.append('  %s = alloca [%d x i8], align 16' % (x.slot, x.size))
+    out.append('  %CC.CF = alloca i1')
+    out.append('  %CC.CF.init = freeze i1 poison')
+    out.append('  store i1 %CC.CF.init, ptr %CC.CF')
     if self.retparam and self.retparam[1] is None:
       # An array: the bytes the IR's return value is laid out in.
       out.append('  %%retval = alloca [%d x i8], align 16' % self.retparam[2])
@@ -685,7 +723,8 @@ class Lifter:
     for n in sorted(self.globals_used):
       head.append(self.globals[n][0])
     head.append('')
-    return '\n'.join(head + out + [''] + sorted(self.decls.values())) + '\n'
+    return '\n'.join(head + out + [''] + sorted(self.decls.values()) + [''] +
+                     sorted(self.attr_groups.values())) + '\n'
 
   def fp_env(self):
     """The source function's floating-point environment attributes (its
@@ -744,6 +783,10 @@ class Lifter:
 
   def instr(self, x):
     """Lift x; whether it ended the block."""
+    if isinstance(x, CallParam):
+      # From here, the name is this call site's bytes.
+      self.cparams[x.name] = x
+      return False
     if x.guard and x.base != 'bra':
       # @p x (@!p x): x in a block of its own, run when p (not p).
       p = self.operand(x.guard[0], 1)
@@ -757,6 +800,11 @@ class Lifter:
       if not ended:
         self.emit('br label %%%s' % cont)
       self.lines.append('%s:' % cont)
+      return False
+    # Extended-precision arithmetic: the carry flag CC.CF is machine state.
+    if x.base in ('add', 'sub', 'addc', 'subc') and (x.has('cc') or
+                                                     x.base in ('addc', 'subc')):
+      self.carry_arith(x)
       return False
     # Address arithmetic on pointers keeps their provenance.
     if (x.base in ('add', 'sub', 'selp') and x.operands and
@@ -892,6 +940,38 @@ class Lifter:
   # Pointer arithmetic (what ptx.formal says of add, sub and selp, on
   # pointers, so that the result keeps the pointer's provenance).
 
+  def carry_arith(self, x):
+    """add.cc / addc[.cc] / sub.cc / subc[.cc] (PTX ISA, extended-precision
+    arithmetic): addc adds CC.CF, subc subtracts it; .cc writes the carry
+    out (for sub, the borrow) to CC.CF."""
+    kind, bits = TYPES[self.itype(x)]
+    if kind not in ('u', 's', 'b') or bits not in (32, 64):
+      raise LiftError('carry arithmetic not lifted: ' + str(x))
+    T, W = 'i%d' % bits, 'i%d' % (bits + 1)
+    a = self.operand(x.operands[1], bits)
+    b = self.operand(x.operands[2], bits)
+    ea, eb = self.resize(a, bits, bits + 1, False), self.resize(b, bits, bits + 1, False)
+    cin = '0'
+    if x.base in ('addc', 'subc'):
+      c = self.t()
+      self.emit('%s = load i1, ptr %%CC.CF' % c)
+      cin = self.resize(c, 1, bits + 1, False)
+    r = self.t()
+    if x.base.startswith('add'):
+      s1 = self.t()
+      self.emit('%s = add %s %s, %s' % (s1, W, ea, eb))
+      self.emit('%s = add %s %s, %s' % (r, W, s1, cin))
+    else:
+      bb = self.t()
+      self.emit('%s = add %s %s, %s' % (bb, W, eb, cin))
+      self.emit('%s = sub %s %s, %s' % (r, W, ea, bb))
+    if x.has('cc'):
+      top, cf = self.t(), self.t()
+      self.emit('%s = lshr %s %s, %d' % (top, W, r, bits))
+      self.emit('%s = trunc %s %s to i1' % (cf, W, top))
+      self.emit('store i1 %s, ptr %%CC.CF' % cf)
+    self.write_reg(x.operands[0], self.resize(r, bits + 1, bits, False), T)
+
   def pointer_arith(self, x):
     """add of a pointer and an integer, sub of an integer from a pointer,
     selp of two pointers: whether x was one."""
@@ -1015,6 +1095,24 @@ class Lifter:
                      x.operands[1].strip())
     if not m:
       raise LiftError('parameter access ' + str(x))
+    if m.group(1) in getattr(self, 'cparams', {}):
+      # A call's return value: its bytes.
+      slot = self.cparams[m.group(1)].slot
+      off = int(m.group(2) or 0)
+      for j, d in enumerate(self.elems(x.operands[0], n)):
+        a = self.gep(slot, str(off + j * bits // 8))
+        if d in self.ptr and bits == 64:
+          v = self.t('ld')
+          self.emit('%s = load ptr, ptr %s, align 1' % (v, a))
+          self.write_reg(d, v, 'ptr')
+          continue
+        v = self.read_bits(a, bits) if bits >= 8 else None
+        if d == '_':
+          continue
+        rb = self.reg(d)
+        self.write_reg(d, self.resize(v, bits, max(bits, rb), kind == 's'),
+                       'i%d' % max(bits, rb))
+      return
     idx = [i for i, p in enumerate(self.ptx_params) if p[0] == m.group(1)]
     if not idx:
       raise LiftError('parameter ' + m.group(1))
@@ -1097,6 +1195,18 @@ class Lifter:
   def st_param(self, x, n, bits):
     m = re.fullmatch(r'\[\s*([\w$]+)\s*(?:\+\s*(\d+))?\s*\]',
                      x.operands[0].strip())
+    if m and m.group(1) in getattr(self, 'cparams', {}):
+      # A call's argument: into its bytes.
+      slot = self.cparams[m.group(1)].slot
+      off = int(m.group(2) or 0)
+      for i, s_ in enumerate(self.elems(x.operands[1], n)):
+        a = self.gep(slot, str(off + i * bits // 8))
+        if s_ in self.ptr and bits == 64:
+          self.emit('store ptr %s, ptr %s, align 1' % (self.read_reg(s_), a))
+        else:
+          self.emit('store i%d %s, ptr %s, align 1' %
+                    (bits, self.operand(s_, bits), a))
+      return
     if not m or not self.retparam or m.group(1) != self.retparam[0]:
       raise LiftError('parameter store not lifted: ' + str(x))
     if self.retparam[1] is None:
@@ -1239,6 +1349,109 @@ class Lifter:
     self.emit('%s = and i32 %s, -2147483648' % (sign, v))
     self.emit('%s = select i1 %s, i32 %s, i32 %s' % (r, sub, sign, v))
     return r
+
+  def i_call(self, x):
+    """call[.uni] [(ret),] callee[, (args)]: a call of the IR function,
+    its arguments read from their .param bytes at the IR's types (a byval
+    one is those bytes), its result written to the return value's."""
+    ops = list(x.operands)
+    ret = None
+    if ops and ops[0].startswith('('):
+      ret = ops.pop(0).strip('() ')
+    if not ops:
+      raise LiftError('call ' + str(x))
+    callee = ops.pop(0).strip()
+    args = [a.strip() for a in ops.pop(0).strip('() ').split(',')
+            if a.strip()] if ops else []
+    if ops or not re.fullmatch(r'[\w$.]+', callee):
+      raise LiftError('indirect call not lifted: ' + str(x))
+    rty, ptypes, decl = self.callee(callee)
+    if len(ptypes) != len(args):
+      raise LiftError('call of %s with %d arguments' % (callee, len(args)))
+    vals = []
+    for (t, byval), a in zip(ptypes, args):
+      if a not in self.cparams:
+        raise LiftError('call argument ' + a)
+      slot = self.cparams[a].slot
+      if byval:
+        vals.append('%s %s' % (t, slot))
+        continue
+      v = self.t('arg')
+      w = re.fullmatch(r'i(\d+)', t)
+      if w and int(w.group(1)) % 8:
+        # An integer of fewer bits than its bytes: its bytes, truncated.
+        n = int(w.group(1))
+        nb = (n + 7) // 8 * 8
+        self.emit('%s = load i%d, ptr %s, align 1' % (v, nb, slot))
+        v = self.resize(v, nb, n, False)
+      else:
+        self.emit('%s = load %s, ptr %s, align 1' % (v, t, slot))
+      vals.append('%s %s' % (t, v))
+    if callee != self.name:
+      self.decls[callee] = decl
+    cc = ''.join(w + ' ' for w in decl.split('@')[0].split()
+                 if w in ('fastcc', 'coldcc', 'ptx_device'))
+    if rty == 'void' or ret is None:
+      self.emit('call %s%s @%s(%s)' % (cc, rty, callee, ', '.join(vals)))
+      return
+    r = self.t('call')
+    self.emit('%s = call %s%s @%s(%s)' % (r, cc, rty, callee, ', '.join(vals)))
+    if ret not in self.cparams:
+      raise LiftError('call return ' + ret)
+    w = re.fullmatch(r'i(\d+)', rty)
+    if w and int(w.group(1)) % 8:
+      # Fewer bits than its bytes: written zero-extended (the PTX ABI).
+      n = int(w.group(1))
+      nb = (n + 7) // 8 * 8
+      r = self.resize(r, n, nb, False)
+      rty = 'i%d' % nb
+    self.emit('store %s %s, ptr %s, align 1' % (rty, r,
+                                                self.cparams[ret].slot))
+
+  def callee(self, name):
+    """(return type, [(parameter type, byval)], declaration) of the IR
+    function name, as the source declares or defines it."""
+    m = re.search(r'^(define|declare)\s+(.*?)@"?%s"?\(' % re.escape(name),
+                  self.ll, re.M)
+    if not m:
+      raise LiftError('no IR function ' + name)
+    i, depth = m.end(), 1
+    while depth:
+      depth += {'(': 1, ')': -1}.get(self.ll[i], 0)
+      i += 1
+    ptext = self.ll[m.end():i - 1]
+    tail = self.ll[i:self.ll.index('\n', i)]
+    tail = re.split(r'\{|\bsection\b|\bcomdat\b|\bpersonality\b', tail)[0]
+    prefix = re.sub(r'\b(dso_local|internal|private|linkonce_odr|weak_odr|'
+                    r'hidden|protected|default|local_unnamed_addr|'
+                    r'unnamed_addr|external)\b', ' ', m.group(2))
+    words = split_top(prefix.replace('addrspace (', 'addrspace('), ' ')
+    words = [w for w in words if w]
+    joined = []
+    for w in words:
+      if w.startswith('addrspace(') and joined and joined[-1] == 'ptr':
+        joined[-1] = 'ptr ' + w
+      else:
+        joined.append(w)
+    tys = [w for w in joined if re.fullmatch(
+        r'void|i\d+|half|bfloat|float|double|fp128|ptr( addrspace\(\d+\))?|'
+        r'<.*>|\{.*\}|\[.*\]|%[\w.$"]+', w)]
+    rty = tys[-1] if tys else 'void'
+    params, ptexts = [], []
+    for ptxt in split_top(ptext) if ptext.strip() else []:
+      t = re.match(r'(ptr(?: addrspace\(\d+\))?|<[^>]*>|\[[^\]]*\]|\{[^}]*\}|'
+                   r'%[\w.$"]+|\S+)', ptxt).group(1)
+      params.append((t, 'byval(' in ptxt))
+      ptexts.append(re.sub(r'\s+%[\w.$"]+$', '', ptxt) if m.group(1) == 'define'
+                    else ptxt)
+    attrs = re.findall(r'#\d+', tail)
+    for g in attrs:
+      a = re.search(r'^attributes %s = .*$' % g, self.ll, re.M)
+      if a:
+        self.attr_groups[g] = a.group(0)
+    decl = 'declare %s @%s(%s) %s' % (' '.join(joined), name,
+                                      ', '.join(ptexts), ' '.join(attrs))
+    return rty, params, decl
 
   def i_atom(self, x):
     self.atomic(x, False)

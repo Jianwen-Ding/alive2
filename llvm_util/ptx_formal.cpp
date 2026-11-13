@@ -174,9 +174,11 @@ const vector<string> &typeClass(StringRef C) {
     vector<string> CI = Int;
     CI.insert(CI.end(), Bits.begin(), Bits.end());
     M["cmpint"] = CI;
-    M["float"] = {"f16", "f32", "f64"};
+    M["float"] = {"f16", "bf16", "f32", "f64"};
+    M["f32"] = {"f32"};
+    M["f64"] = {"f64"};
     vector<string> Any = CI;
-    Any.insert(Any.end(), {"f16", "f32", "f64", "pred"});
+    Any.insert(Any.end(), {"f16", "bf16", "f32", "f64", "pred"});
     M["any"] = Any;
     return M;
   }();
@@ -413,9 +415,21 @@ struct Interp {
     return {resize(A, AW, W, Sg), W};
   }
 
-  Value *fp(Value *V, unsigned W) {
-    return B.CreateBitCast(V, fpType(B.getContext(), W));
+  /// The float type of W bits: bf16 for 16 bits where the instruction's
+  /// types are bf16 (and not f16).
+  Type *ftype(unsigned W) {
+    if (W == 16) {
+      bool BF = false, F16 = false;
+      for (const string &V : Bd.Vars) {
+        BF |= Bd.Vals.at(V) == "bf16";
+        F16 |= Bd.Vals.at(V) == "f16";
+      }
+      if (BF && !F16)
+        return Type::getBFloatTy(B.getContext());
+    }
+    return fpType(B.getContext(), W);
   }
+  Value *fp(Value *V, unsigned W) { return B.CreateBitCast(V, ftype(W)); }
   Value *unfp(Value *V, unsigned W) {
     return B.CreateBitCast(V, B.getIntNTy(W));
   }
@@ -486,7 +500,7 @@ struct Interp {
         throw NeedWidth();
       APFloat F(X.F);
       bool Lost;
-      F.convert(fpType(C, Want)->getFltSemantics(),
+      F.convert(ftype(Want)->getFltSemantics(),
                 APFloat::rmNearestTiesToEven, &Lost);
       return {ConstantInt::get(C, F.bitcastToAPInt()), Want};
     }
@@ -536,6 +550,116 @@ struct Interp {
       return ev(A[isSigned("") ? 0 : 1], En, Want);
     if (H == "has")
       return lit(Bd.Vals.count("has:" + A[0].S) ? 1 : 0, 1);
+    if (H == "if-has")
+      return ev(A[Bd.Vals.count("has:" + A[0].S) ? 1 : 2], En, Want);
+
+    // Directed roundings: LLVM's constrained intrinsics.
+    if (H == "fp.rounded") {
+      auto It = Bd.Vals.find(A[0].S);
+      string Mode = It == Bd.Vals.end() ? A[0].S : It->second;
+      SExpr Op = A[1];
+      ArrayRef<SExpr> Rest = A.drop_front(2);
+      if (Mode == "rn") {
+        SExpr Call;
+        Call.L.push_back(Op);
+        Call.L.insert(Call.L.end(), Rest.begin(), Rest.end());
+        return ev(Call, En, Want);
+      }
+      optional<RoundingMode> RM = StringSwitch<optional<RoundingMode>>(Mode)
+                                      .Case("rz", RoundingMode::TowardZero)
+                                      .Case("rm", RoundingMode::TowardNegative)
+                                      .Case("rp", RoundingMode::TowardPositive)
+                                      .Default(nullopt);
+      if (!RM)
+        throw FormalError("rounding " + Mode);
+      IRBuilder<>::FastMathFlagGuard Guard(B);
+      B.setIsFPConstrained(true);
+      B.setDefaultConstrainedRounding(*RM);
+      B.setDefaultConstrainedExcept(fp::ebIgnore);
+      if (Op.S == "fp.narrow" || Op.S == "fp.from-sint" ||
+          Op.S == "fp.from-uint") {
+        Val X = ev(Rest[0], En, 0);
+        unsigned N = statOrFail(Rest[1]);
+        Value *R;
+        if (Op.S == "fp.narrow")
+          R = B.CreateFPTrunc(fp(X.V, X.W), ftype(N));
+        else if (Op.S == "fp.from-sint")
+          R = B.CreateSIToFP(X.V, ftype(N));
+        else
+          R = B.CreateUIToFP(X.V, ftype(N));
+        return {unfp(R, N), N};
+      }
+      auto [Vs, W] = same(Rest, En, Want);
+      SmallVector<Value *, 3> As;
+      for (Val &V : Vs)
+        As.push_back(fp(V.V, W));
+      Value *R;
+      if (Op.S == "fp.add")
+        R = B.CreateFAdd(As[0], As[1]);
+      else if (Op.S == "fp.sub")
+        R = B.CreateFSub(As[0], As[1]);
+      else if (Op.S == "fp.mul")
+        R = B.CreateFMul(As[0], As[1]);
+      else if (Op.S == "fp.div")
+        R = B.CreateFDiv(As[0], As[1]);
+      else if (Op.S == "fp.fma")
+        R = B.CreateConstrainedFPCall(
+            Intrinsic::getOrInsertDeclaration(
+                B.GetInsertBlock()->getModule(),
+                Intrinsic::experimental_constrained_fma, {As[0]->getType()}),
+            As);
+      else if (Op.S == "fp.sqrt")
+        R = B.CreateConstrainedFPCall(
+            Intrinsic::getOrInsertDeclaration(
+                B.GetInsertBlock()->getModule(),
+                Intrinsic::experimental_constrained_sqrt, {As[0]->getType()}),
+            As);
+      else
+        throw FormalError("fp.rounded of " + Op.S);
+      return {unfp(R, W), W};
+    }
+    if (H == "fp.ftz") {
+      Val X = ev(A[0], En, Want);
+      Type *F = ftype(X.W);
+      APInt E = APInt::getZero(X.W), Mt = APInt::getZero(X.W);
+      if (F->isHalfTy())
+        E = APInt(16, 0x7c00), Mt = APInt(16, 0x3ff);
+      else if (F->isBFloatTy())
+        E = APInt(16, 0x7f80), Mt = APInt(16, 0x7f);
+      else if (F->isFloatTy())
+        E = APInt(32, 0x7f800000), Mt = APInt(32, 0x7fffff);
+      else
+        E = APInt(64, 0x7ff0000000000000ull), Mt = APInt(64, 0xfffffffffffffull);
+      Value *Sub = B.CreateAnd(
+          B.CreateICmpEQ(B.CreateAnd(X.V, ConstantInt::get(C, E)),
+                         ConstantInt::get(C, APInt::getZero(X.W))),
+          B.CreateICmpNE(B.CreateAnd(X.V, ConstantInt::get(C, Mt)),
+                         ConstantInt::get(C, APInt::getZero(X.W))));
+      Value *Sign = B.CreateAnd(
+          X.V, ConstantInt::get(C, APInt::getSignMask(X.W)));
+      return {B.CreateSelect(Sub, Sign, X.V), X.W};
+    }
+    if (H == "fp.sat" || H == "fp.relu") {
+      Val X = ev(A[0], En, Want);
+      Type *F = ftype(X.W);
+      Value *Fv = fp(X.V, X.W);
+      Value *R;
+      if (H == "fp.sat") {
+        // To [0, 1]; NaN to 0.
+        R = B.CreateMinNum(B.CreateMaxNum(Fv, ConstantFP::get(F, 0.0)),
+                           ConstantFP::get(F, 1.0));
+      } else {
+        // A negative result 0, a NaN the canonical NaN.
+        Value *Canon = ConstantFP::get(
+            F, APFloat(F->getFltSemantics(),
+                       APInt::getSignedMaxValue(X.W)));
+        Value *S1 = B.CreateSelect(
+            B.CreateFCmpOLT(Fv, ConstantFP::get(F, 0.0)),
+            ConstantFP::get(F, 0.0), Fv);
+        R = B.CreateSelect(B.CreateFCmpUNO(Fv, Fv), Canon, S1);
+      }
+      return {unfp(R, X.W), X.W};
+    }
 
     // Bit-vectors.
     optional<Instruction::BinaryOps> Bin =
@@ -698,6 +822,10 @@ struct Interp {
                                        .Case("fp.ceil", Intrinsic::ceil)
                                        .Case("fp.minnum", Intrinsic::minnum)
                                        .Case("fp.maxnum", Intrinsic::maxnum)
+                                       .Case("fp.minimumnum", Intrinsic::minimumnum)
+                                       .Case("fp.maximumnum", Intrinsic::maximumnum)
+                                       .Case("fp.minimum", Intrinsic::minimum)
+                                       .Case("fp.maximum", Intrinsic::maximum)
                                        .Case("fp.copysign", Intrinsic::copysign)
                                        .Case("fp.fma", Intrinsic::fma)
                                        .Default(nullopt);
@@ -706,7 +834,7 @@ struct Interp {
       SmallVector<Value *, 3> As;
       for (Val &V : Vs)
         As.push_back(fp(V.V, W));
-      return {unfp(intr(*FInt, {fpType(C, W)}, As), W), W};
+      return {unfp(intr(*FInt, {ftype(W)}, As), W), W};
     }
     if (H == "fcmp") {
       auto [Vs, W] = same(A.drop_front(), En, 0);
@@ -736,15 +864,15 @@ struct Interp {
       if ((N > V.W) != (H == "fp.extend") || N == V.W)
         throw FormalError(H.str() + ": widths");
       Value *F = fp(V.V, V.W);
-      Value *R = H == "fp.extend" ? B.CreateFPExt(F, fpType(C, N))
-                                  : B.CreateFPTrunc(F, fpType(C, N));
+      Value *R = H == "fp.extend" ? B.CreateFPExt(F, ftype(N))
+                                  : B.CreateFPTrunc(F, ftype(N));
       return {unfp(R, N), N};
     }
     if (H == "fp.from-sint" || H == "fp.from-uint") {
       Val V = ev(A[0], En, 0);
       unsigned N = statOrFail(A[1]);
-      Value *R = H == "fp.from-sint" ? B.CreateSIToFP(V.V, fpType(C, N))
-                                     : B.CreateUIToFP(V.V, fpType(C, N));
+      Value *R = H == "fp.from-sint" ? B.CreateSIToFP(V.V, ftype(N))
+                                     : B.CreateUIToFP(V.V, ftype(N));
       return {unfp(R, N), N};
     }
     if (H == "fp.to-int-sat") {
@@ -753,7 +881,7 @@ struct Interp {
       unsigned N = varWidth(Var);
       Value *R = intr(isSigned(Var) ? Intrinsic::fptosi_sat
                                     : Intrinsic::fptoui_sat,
-                      {B.getIntNTy(N), fpType(C, V.W)}, {fp(V.V, V.W)});
+                      {B.getIntNTy(N), ftype(V.W)}, {fp(V.V, V.W)});
       return {R, N};
     }
     if (H == "uninterpreted") {
@@ -761,7 +889,7 @@ struct Interp {
       for (const SExpr &Y : A.drop_front())
         Vs.push_back(ev(Y, En, Want));
       unsigned W = Vs[0].W;
-      Type *F = fpType(C, W);
+      Type *F = ftype(W);
       SmallVector<Type *, 3> Tys(Vs.size(), F);
       SmallVector<Value *, 3> As;
       for (Val &V : Vs)

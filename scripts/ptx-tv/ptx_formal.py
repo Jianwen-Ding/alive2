@@ -8,6 +8,7 @@ format: which instructions there are, and what they compute, is all
 ptx.formal's.
 """
 
+import copy
 import os
 import re
 import struct
@@ -67,7 +68,7 @@ def atom(t):
 
 INT = ['s8', 's16', 's32', 's64', 'u8', 'u16', 'u32', 'u64']
 BITS = ['b8', 'b16', 'b32', 'b64']
-FLOAT = ['f16', 'f32', 'f64']
+FLOAT = ['f16', 'bf16', 'f32', 'f64']
 CLASSES = {
     'int': INT,
     'sint': [t for t in INT if t[0] == 's'],
@@ -76,6 +77,8 @@ CLASSES = {
     'int32-64': ['s32', 'u32', 's64', 'u64'],
     'bits': BITS,
     'b32': ['b32'],
+    'f32': ['f32'],
+    'f64': ['f64'],
     'bits32-64': ['b32', 'b64'],
     'bitsp': BITS + ['pred'],
     'ubits': [t for t in INT if t[0] == 'u'] + BITS,
@@ -170,11 +173,33 @@ class Formal:
     return None, None
 
   def lift(self, lifter, x):
-    """Lift x by its entry: whether there was one."""
+    """Lift x by its entry: whether there was one. A packed instruction
+    (add.rn.f16x2, all its types of two lanes) is its scalar entry's,
+    lane by lane."""
     e, b = self.find(x)
+    if e is not None:
+      Interp(self, lifter, x, e, b).run()
+      return True
+    parts = x.op.split('.')
+    packed = [p for p in parts[1:] if re.fullmatch(r'(f16|bf16|f32|[sub]16)x2', p)]
+    if not packed or len(set(packed)) != 1 or any(
+        p in ('f16', 'bf16', 'f32', 'f64') or re.fullmatch(r'[sub]\d+', p)
+        for p in parts[1:]):
+      return False
+    scalar = copy.copy(x)
+    scalar.op = '.'.join(p[:-2] if p == packed[0] else p for p in parts)
+    scalar.mods = scalar.op.split('.')
+    e, b = self.find(scalar)
     if e is None:
       return False
-    Interp(self, lifter, x, e, b).run()
+    lanes = [Interp(self, lifter, scalar, e, b, lane=i).value() for i in range(2)]
+    w = lanes[0][1]
+    lo = lifter.resize(lanes[0][0], w, 2 * w, False)
+    hi = lifter.resize(lanes[1][0], w, 2 * w, False)
+    sh, r = lifter.t('f'), lifter.t('f')
+    lifter.emit('%s = shl i%d %s, %d' % (sh, 2 * w, hi, w))
+    lifter.emit('%s = or i%d %s, %s' % (r, 2 * w, sh, lo))
+    lifter.write_reg(x.operands[0], r, 'i%d' % (2 * w))
     return True
 
 
@@ -225,8 +250,9 @@ FP_INTR2 = {'fp.minnum': 'minnum', 'fp.maxnum': 'maxnum',
 
 
 class Interp:
-  def __init__(self, formal, lifter, x, entry, bindings):
+  def __init__(self, formal, lifter, x, entry, bindings, lane=None):
     self.f, self.L, self.x, self.e, self.b = formal, lifter, x, entry, bindings
+    self.lane = lane
     vars_ = bindings.get('vars', [])
     self.first = vars_[0] if vars_ else None
     self.ops = {}
@@ -298,6 +324,14 @@ class Interp:
     i, ann = self.ops[name]
     w, sg = self.ann_width(ann)
     tok = self.x.operands[i]
+    if self.lane is not None:
+      # A lane of a packed operand (lane 0 the low half).
+      full = self.L.operand(tok, 2 * w)
+      if self.lane:
+        sh = self.L.t('f')
+        self.L.emit('%s = lshr i%d %s, %d' % (sh, 2 * w, full, w))
+        full = sh
+      return (self.L.resize(full, 2 * w, w, False), w)
     return (self.L.operand(tok, w, sg), w)
 
   def emit(self, text):
@@ -326,11 +360,20 @@ class Interp:
                                                       self.x))
     return vals, w
 
+  def ftype(self, w):
+    """The float type of w bits: bf16 for 16 bits where the instruction's
+    types are bf16 (and not f16)."""
+    if w == 16:
+      tys = set(self.b.get(v) for v in self.b.get('vars', []))
+      if 'bf16' in tys and 'f16' not in tys:
+        return 'bfloat'
+    return ftype(w)
+
   def fp(self, v, w):
-    return self.L.cast('bitcast', v, 'i%d' % w, ftype(w))
+    return self.L.cast('bitcast', v, 'i%d' % w, self.ftype(w))
 
   def unfp(self, v, w):
-    return self.L.cast('bitcast', v, ftype(w), 'i%d' % w)
+    return self.L.cast('bitcast', v, self.ftype(w), 'i%d' % w)
 
   def ev(self, e, env, want):
     if isinstance(e, FloatLit):
@@ -381,6 +424,8 @@ class Interp:
       return self.ev(a[0] if self.signed() else a[1], env, want)
     if h == 'has':
       return self.lit(int(self.b.get('has:' + a[0], False)), 1)
+    if h == 'if-has':
+      return self.ev(a[1] if self.b.get('has:' + a[0]) else a[2], env, want)
 
     # Bit-vectors.
     if h in SAME:
@@ -464,27 +509,105 @@ class Interp:
       return (self.emit('freeze i%d poison' % n), n)
 
     # Floats.
+    if h == 'fp.rounded':
+      # An operation rounding as RND says: rn to nearest even, rz toward
+      # zero, rm down, rp up (LLVM's constrained intrinsics).
+      mode = self.b.get(a[0], a[0])
+      op, args = a[1], a[2:]
+      if mode == 'rn':
+        return self.ev([op] + args, env, want)
+      md = {'rz': 'round.towardzero', 'rm': 'round.downward',
+            'rp': 'round.upward'}[mode]
+      sfxs = {'half': 'f16', 'bfloat': 'bf16', 'float': 'f32',
+              'double': 'f64'}
+      if op in ('fp.narrow', 'fp.from-sint', 'fp.from-uint'):
+        x = self.ev(args[0], env, None)
+        n = self.static(args[1], env)
+        F = self.ftype(n)
+        if op == 'fp.narrow':
+          S = self.ftype(x[1])
+          name = 'llvm.experimental.constrained.fptrunc.%s.%s' % (sfxs[F],
+                                                                   sfxs[S])
+          arg = (S, self.fp(x[0], x[1]))
+        else:
+          name = 'llvm.experimental.constrained.%s.%s.i%d' % (
+              'sitofp' if op == 'fp.from-sint' else 'uitofp', sfxs[F], x[1])
+          arg = ('i%d' % x[1], x[0])
+        r = L.call(name, F, [arg, ('metadata', '!"%s"' % md),
+                             ('metadata', '!"fpexcept.ignore"')])
+        return (self.unfp(r, n), n)
+      name = {'fp.add': 'fadd', 'fp.sub': 'fsub', 'fp.mul': 'fmul',
+              'fp.div': 'fdiv', 'fp.fma': 'fma', 'fp.sqrt': 'sqrt'}[op]
+      vals, w = self.same(args, env, want)
+      F = self.ftype(w)
+      sfx = {'half': 'f16', 'bfloat': 'bf16', 'float': 'f32',
+             'double': 'f64'}[F]
+      r = L.call('llvm.experimental.constrained.%s.%s' % (name, sfx), F,
+                 [(F, self.fp(v[0], w)) for v in vals] +
+                 [('metadata', '!"%s"' % md),
+                  ('metadata', '!"fpexcept.ignore"')])
+      return (self.unfp(r, w), w)
+    if h in ('fp.ftz', 'fp.sat', 'fp.relu'):
+      x = self.ev(a[0], env, want)
+      w = x[1]
+      F = self.ftype(w)
+      if h == 'fp.ftz':
+        # A subnormal is a zero of its sign.
+        e_bits, m_bits = {'half': (0x7c00, 0x3ff), 'bfloat': (0x7f80, 0x7f),
+                          'float': (0x7f800000, 0x7fffff),
+                          'double': (0x7ff0000000000000,
+                                     0xfffffffffffff)}[F]
+        T = 'i%d' % w
+        e_, m_, z, nz, sub, sign, r = [self.L.t('f') for _ in range(7)]
+        self.L.emit('%s = and %s %s, %d' % (e_, T, x[0], signed_(e_bits, w)))
+        self.L.emit('%s = and %s %s, %d' % (m_, T, x[0], m_bits))
+        self.L.emit('%s = icmp eq %s %s, 0' % (z, T, e_))
+        self.L.emit('%s = icmp ne %s %s, 0' % (nz, T, m_))
+        self.L.emit('%s = and i1 %s, %s' % (sub, z, nz))
+        self.L.emit('%s = and %s %s, %d' % (sign, T, x[0], -(1 << (w - 1))))
+        self.L.emit('%s = select i1 %s, %s %s, %s %s' % (r, sub, T, sign, T, x[0]))
+        return (r, w)
+      f = self.fp(x[0], w)
+      if h == 'fp.sat':
+        # To [0, 1]; NaN to 0.
+        zero = L.intr('maxnum', F, [(F, f), (F, '0.0')])
+        r = L.intr('minnum', F, [(F, zero), (F, '1.0')])
+        return (self.unfp(r, w), w)
+      # relu: a negative result is 0, a NaN the canonical NaN.
+      nan, neg, s1, r = [self.L.t('f') for _ in range(4)]
+      canon = {'half': '0xH7FFF', 'bfloat': '0xR7FFF', 'float': '0x7FFFFFFFE0000000',
+               'double': '0x7FFFFFFFFFFFFFFF'}[F]
+      self.L.emit('%s = fcmp uno %s %s, %s' % (nan, F, f, f))
+      self.L.emit('%s = fcmp olt %s %s, 0.0' % (neg, F, f))
+      self.L.emit('%s = select i1 %s, %s 0.0, %s %s' % (s1, neg, F, F, f))
+      self.L.emit('%s = select i1 %s, %s %s, %s %s' % (r, nan, F, canon, F, s1))
+      return (self.unfp(r, w), w)
+    if h in ('fp.minimum', 'fp.maximum', 'fp.minimumnum', 'fp.maximumnum'):
+      (x, y), w = self.same(a, env, want)
+      F = self.ftype(w)
+      r = L.intr(h[3:], F, [(F, self.fp(x[0], w)), (F, self.fp(y[0], w))])
+      return (self.unfp(r, w), w)
     if h in FP2 or (h == 'fp.contract' and a[0] in FP2):
       flags = ''
       if h == 'fp.contract':
         h, a, flags = a[0], a[1:], 'contract '
       (x, y), w = self.same(a, env, want)
-      r = self.emit('%s %s%s %s, %s' % (FP2[h], flags, ftype(w),
+      r = self.emit('%s %s%s %s, %s' % (FP2[h], flags, self.ftype(w),
                                         self.fp(x[0], w), self.fp(y[0], w)))
       return (self.unfp(r, w), w)
     if h == 'fp.neg':
       x = self.ev(a[0], env, want)
-      r = self.emit('fneg %s %s' % (ftype(x[1]), self.fp(x[0], x[1])))
+      r = self.emit('fneg %s %s' % (self.ftype(x[1]), self.fp(x[0], x[1])))
       return (self.unfp(r, x[1]), x[1])
     if h in FP_INTR1 or h in FP_INTR2 or h == 'fp.fma':
       vals, w = self.same(a, env, want)
-      F = ftype(w)
+      F = self.ftype(w)
       name = FP_INTR1.get(h) or FP_INTR2.get(h) or 'fma'
       r = L.intr(name, F, [(F, self.fp(v[0], w)) for v in vals])
       return (self.unfp(r, w), w)
     if h == 'fcmp':
       (x, y), w = self.same(a[1:], env, None)
-      F = ftype(w)
+      F = self.ftype(w)
       return (self.emit('fcmp %s %s %s, %s' % (a[0], F, self.fp(x[0], w),
                                                self.fp(y[0], w))), 1)
     if h in ('fp.extend', 'fp.narrow'):
@@ -494,27 +617,28 @@ class Interp:
         raise FormalError('%s from %d to %d bits in %s' % (h, x[1], n,
                                                            self.x))
       op = 'fpext' if h == 'fp.extend' else 'fptrunc'
-      r = L.cast(op, self.fp(x[0], x[1]), ftype(x[1]), ftype(n))
+      r = L.cast(op, self.fp(x[0], x[1]), self.ftype(x[1]), self.ftype(n))
       return (self.unfp(r, n), n)
     if h in ('fp.from-sint', 'fp.from-uint'):
       x = self.ev(a[0], env, None)
       n = self.static(a[1], env)
       op = 'sitofp' if h == 'fp.from-sint' else 'uitofp'
-      r = L.cast(op, x[0], 'i%d' % x[1], ftype(n))
+      r = L.cast(op, x[0], 'i%d' % x[1], self.ftype(n))
       return (self.unfp(r, n), n)
     if h == 'fp.to-int-sat':
       v = a[0]
       x = self.ev(a[1], env, None)
       n = self.var_width(v)
-      F = ftype(x[1])
+      F = self.ftype(x[1])
       name = 'llvm.fpto%si.sat.i%d.%s' % ('s' if self.signed(v) else 'u', n,
                                           {'half': 'f16', 'float': 'f32',
+                                           'bfloat': 'bf16',
                                            'double': 'f64'}[F])
       return (L.call(name, 'i%d' % n, [(F, self.fp(x[0], x[1]))]), n)
     if h == 'uninterpreted':
       vals = [self.ev(y, env, want) for y in a[1:]]
       w = vals[0][1]
-      F = ftype(w)
+      F = self.ftype(w)
       r = L.call(str(a[0]), F, [(F, self.fp(v[0], w)) for v in vals],
                  ' nounwind readnone')
       return (self.unfp(r, w), w)
@@ -523,6 +647,19 @@ class Interp:
   def run(self):
     self.cache = {}
     self.stmt(self.e.body, {})
+
+  def value(self):
+    """The destination's value (for a lane of a packed instruction)."""
+    self.cache = {}
+    s, env = self.e.body, {}
+    while s[0] == 'let':
+      env = dict(env)
+      for name, ex in s[1]:
+        env[name] = Thunk(self, ex, dict(env))
+      s = s[2]
+    i, ann = self.ops[s[1]]
+    w, _ = self.ann_width(ann)
+    return self.ev(s[2], env, w)
 
   def stmt(self, s, env):
     if s[0] == 'let':
@@ -551,6 +688,10 @@ class Interp:
       val = self.L.resize(val, w, rb, sg)
       w = rb
     self.L.write_reg(dest, val, 'i%d' % w)
+
+
+def signed_(v, w):
+  return v - (1 << w) if v >> (w - 1) else v
 
 
 def subst(e, m):

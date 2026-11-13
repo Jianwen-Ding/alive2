@@ -24,7 +24,17 @@ $ scripts/ptx-tv/search/batch.py corpus fwork --verify > fuzz.jsonl
 What it found (LLVM main of 2026-11-12, Z3 5.4.1)
 --------------------------------------------------
 
-No miscompilation in the NVPTX backend.
+One defect, in `findings/`: `<N x i1>` parameters, return values and call
+arguments are declared as one byte (`.b8 param0[1]`) and accessed one byte
+per element, past the declaration. Nothing else: the mismatches below are
+false alarms.
+
+The second round lifted calls (call sites' `.param` bytes, `call.uni`),
+carries (`add.cc`, `addc`, `sub.cc`, `subc`), and in the formalization the
+directed roundings, `.ftz`, `.sat`, `.relu`, `.NaN` min/max, bf16 and packed
+`x2` instructions lane by lane: of the 139 test-suite functions that needed
+calls or carries, 82 verify; of the 497 that needed the float
+instructions, the rest are mostly packed conversions and FP8/FP4 formats.
 
 * llvm/test/CodeGen/NVPTX, up to 8 functions of each of its 663 files:
   755 verify, 223 time out (10 s), 1416 are not lifted (calls, Hopper and

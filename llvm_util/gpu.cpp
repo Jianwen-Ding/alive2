@@ -190,7 +190,7 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
     ValueToValueMapTy VMap;
     Function *Copy = CloneFunction(&F, VMap);
     Copy->setName(F.getName() + ".alive2.inlined");
-    for (unsigned Round = 0; Round < 16; ++Round) {
+    for (unsigned Round = 0; Round < 16 && Target.inlinesCalls(); ++Round) {
       SmallVector<CallBase *, 8> Calls;
       for (Instruction &I : instructions(*Copy))
         if (auto *CB = dyn_cast<CallBase>(&I))
