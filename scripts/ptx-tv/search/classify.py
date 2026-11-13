@@ -27,6 +27,11 @@ def classify(r):
   d = '%s/%s' % (work, r['file'])
   src = func_text(open(d + '/src.ll').read(), r['func'])
   src0 = func_text(open(d + '/src0.ll').read(), r['func'])
+  # The finding (findings/README.md): an <N x i1> parameter, return value
+  # or argument declared as one byte and accessed past it.
+  if re.search(r'<\d+ x i1>', src.split('\n')[0]) and \
+     re.search(r'\.b8\s+[\w$]+\[1\]', open(d + '/out.ptx').read()):
+    return 'FINDING-vNi1-param-out-of-bounds'
   # Inline asm: opaque to alive2 in the IR, its text in the PTX.
   if re.search(r'\basm\b', src):
     return 'inline-asm'
