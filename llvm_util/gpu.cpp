@@ -226,7 +226,8 @@ struct GPUCanonicalizer : ValueMaterializer {
   }
 
   /// A shuffle of the SIMD-group (quad-group): mode "" reads lane Arg, "xor"
-  /// lane ^ Arg, "up" lane - Arg and "down" lane + Arg, as MSL defines them:
+  /// lane ^ Arg, "up" lane - Arg, "down" lane + Arg and "rotate.up"
+  /// (lane - Arg) mod the group's size, as MSL defines them:
   /// a thread whose source lane would be outside of the group (the lowest
   /// Arg lanes for up, the highest for down) keeps its value. All are reads
   /// of a lane, one primitive: a quad-group's lane j is the SIMD-group's
@@ -242,6 +243,8 @@ struct GPUCanonicalizer : ValueMaterializer {
     Value *Src = Arg;
     if (Mode == "xor")
       Src = B.CreateXor(Self, Arg);
+    else if (Mode == "rotate.up")
+      Src = B.CreateAnd(B.CreateSub(Self, Arg), N - 1);
     else if (Mode == "up")
       Src = B.CreateSelect(B.CreateICmpUGE(Self, Arg), B.CreateSub(Self, Arg),
                            Self);
@@ -869,7 +872,7 @@ struct GPUCanonicalizer : ValueMaterializer {
       StringRef Mode = Base.drop_front(5);
       if (Mode.consume_front("shuffle") && CI.arg_size() == 2 &&
           (Mode.empty() || Mode == ".xor" || Mode == ".up" ||
-           Mode == ".down")) {
+           Mode == ".down" || Mode == ".rotate.up")) {
         Mode.consume_front(".");
         R = shuffle(B, Quad, Mode, CI.getArgOperand(0), CI.getArgOperand(1));
         return true;
