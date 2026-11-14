@@ -229,10 +229,12 @@ struct GPUCanonicalizer : ValueMaterializer {
   /// lane ^ Arg, "up" lane - Arg and "down" lane + Arg, as MSL defines them:
   /// a thread whose source lane would be outside of the group (the lowest
   /// Arg lanes for up, the highest for down) keeps its value. All are reads
-  /// of a lane, one primitive.
+  /// of a lane, one primitive: a quad-group's lane j is the SIMD-group's
+  /// lane (lane & ~3) + j, so its shuffles are the SIMD-group's reads too.
   Value *shuffle(IRBuilder<> &B, bool Quad, StringRef Mode, Value *X,
                  Value *Arg) {
-    Value *Self = systemValue(B, "thread_index_in_simdgroup")[0];
+    Value *Lane = systemValue(B, "thread_index_in_simdgroup")[0];
+    Value *Self = Lane;
     unsigned N = Quad ? 4 : 32;
     if (Quad)
       Self = B.CreateAnd(Self, 3);
@@ -250,8 +252,13 @@ struct GPUCanonicalizer : ValueMaterializer {
                                          B.getInt32(N)),
                          B.CreateAdd(Self, Arg), Self),
           Self);
-    return convergent(B, Quad ? "quad.shuffle" : "simd.shuffle", X->getType(),
-                      {X, Src});
+    // (a quad lane past the quad keeps its value, as the masked hardware
+    // recordings of quad_shuffle and quad_shuffle_xor by 4 and 255 show)
+    if (Quad)
+      Src = B.CreateOr(B.CreateAnd(Lane, ~3u),
+                       B.CreateSelect(B.CreateICmpULT(Src, B.getInt32(4)), Src,
+                                      Self));
+    return convergent(B, "simd.shuffle", X->getType(), {X, Src});
   }
 
   void barrier(IRBuilder<> &B, bool Memory) {
