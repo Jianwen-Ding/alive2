@@ -9,6 +9,7 @@
 #include "llvm_util/gpu_target.h"
 #include "util/config.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/AttributeMask.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -573,11 +574,22 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
   }
 
   /// Fences with no access of memory between them are one: what other
-  /// threads may do at the first, they may at the second.
+  /// threads may do at the first, they may at the second. A load or store
+  /// of the thread's own alloca is no such access: no other thread sees it
+  /// (AIR's cmpxchg reads its expected value from one, which the AGX IR
+  /// does before the fence rather than after).
   void mergeFences(Function &Fn) {
     Function *Fence = M.getFunction("alive.gpu.fence");
     if (!Fence)
       return;
+    auto Private = [](Instruction &I) {
+      if (!isa<LoadInst>(I) && !isa<StoreInst>(I))
+        return false;
+      if (cast<Instruction>(I).isVolatile() || I.isAtomic())
+        return false;
+      return isa<AllocaInst>(
+          getUnderlyingObject(getLoadStorePointerOperand(&I)));
+    };
     for (BasicBlock &BB : Fn) {
       CallInst *Last = nullptr;
       for (Instruction &I : make_early_inc_range(BB)) {
@@ -588,6 +600,8 @@ struct GPUCanonicalizer : GPUBuilder, ValueMaterializer {
             continue;
           }
           Last = CI;
+        } else if (Private(I)) {
+          continue;
         } else if (I.mayReadOrWriteMemory() || I.isTerminator()) {
           Last = nullptr;
         }
