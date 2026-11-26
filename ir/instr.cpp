@@ -936,7 +936,12 @@ static StateValue fp_uf_value(State &s, const char *op,
     vals.push_back(s.getFpRoundingMode());
   expr range = args[0].value;
   if (commutative) {
+    // the operands in the order of their terms first (umin / umax are symmetric, so this changes no meaning):
+    // a transformation that only swaps them gives the same term in source and target, which the solver need
+    // not prove equal by case analysis (inside loops and memory it timed out on that)
     expr x = vals[0], y = vals[1];
+    if (y.id() < x.id())
+      std::swap(x, y);
     vals[0] = x.umin(y);
     vals[1] = x.umax(y);
   }
