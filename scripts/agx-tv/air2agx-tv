@@ -16,7 +16,8 @@
 #
 # alive2 does not read scoped alias metadata (!alias.scope, !noalias), which
 # the Metal pipeline gives the AIR: both sides lose it. That only drops UB
-# (aliasing the metadata rules out), so a proof without it still holds.
+# (aliasing the metadata rules out), so a proof without it still holds; a
+# transformation that needed it fails to verify.
 #
 #   air2agx-tv [-mcpu=agx-g14c] [--keep DIR] kernel.ll [alive-tv options...]
 #
@@ -58,6 +59,16 @@ EOF
 for f in "$dir/$k.air.ll" "$dir/$k.agx.ll"; do
   sed -E -i 's/, !(alias\.scope|noalias) ![0-9]+//g' "$f"
 done
+# The parameters' readonly / writeonly, which -O3 infers where the buffers'
+# address spaces keep them apart, go too: alive2's canonical form has one address space, where a
+# constant and a device buffer may be one block. Without them the AGX IR is
+# more defined: as the target of step 3 and the source of step 4 the checks
+# are only stricter.
+sed -E -i '/^define /s/ (readonly|writeonly)//g' "$dir/$k.agx.ll"
+# Likewise the functions' memory(...) effects: a load of AGX's constant
+# address space reads nothing that changes, which alive2's one space cannot
+# know.
+sed -E -i '/^attributes /s/ memory\([^)]*\)//g' "$dir/$k.agx.ll"
 
 status=0
 echo "== AIR from the .metallib -> AGX IR ($k.air.ll -> $k.agx.ll)"
