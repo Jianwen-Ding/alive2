@@ -909,6 +909,41 @@ static StateValue fm_poison(State &s, expr a, const expr &ap,
                    ty, fmath, rm, bitwise, flags_in_only, to_ty, 1);
 }
 
+
+// --fp-uf: the operation as an uninterpreted function of its operands' bits,
+// named after everything else that decides its result (type, fast-math flags,
+// rounding mode, denormal mode), so no floating point theory is involved. The
+// first two operands of a commutative operation are taken in the order of
+// their bits. Poison: the operands'; flags that add poison are in the name,
+// so a transformation that changes them fails to prove (conservative).
+static StateValue fp_uf_value(State &s, const char *op,
+                              vector<StateValue> args, const Type &ty,
+                              FastMathFlags fmath, FpRoundingMode rm,
+                              bool commutative) {
+  std::ostringstream name;
+  auto denormal = (fmath.flags & FastMathFlags::KeepDenormals)
+                    ? FPDenormalAttrs::IEEE
+                    : s.getFn().getFnAttrs().getFPDenormal(ty).output;
+  name << "fp_uf." << op << '.' << ty.bits() << ".f" << fmath.flags << ".r"
+       << (rm.isDefault() ? -1 : (int)rm.getMode()) << ".d" << (int)denormal;
+  vector<expr> vals;
+  AndExpr np;
+  for (auto &a : args) {
+    vals.push_back(a.value);
+    np.add(a.non_poison);
+  }
+  if (!rm.isDefault() && rm.isDynamic())
+    vals.push_back(s.getFpRoundingMode());
+  expr range = args[0].value;
+  if (commutative) {
+    expr x = vals[0], y = vals[1];
+    vals[0] = x.umin(y);
+    vals[1] = x.umax(y);
+  }
+  expr v = expr::mkUF(name.str(), vals, range);
+  return { std::move(v), np() };
+}
+
 StateValue FpBinOp::toSMT(State &s) const {
   function<expr(const expr&, const expr&, const expr&)> fn;
   bool bitwise = false;
@@ -989,25 +1024,15 @@ StateValue FpBinOp::toSMT(State &s) const {
     break;
   }
 
-  if (config::fp_uf && (op == FAdd || op == FSub || op == FMul || op == FDiv ||
-                        op == FRem)) {
-    static const char *names[] = {"fadd", "fsub", "fmul", "fdiv", "frem"};
-    string name = string("fp_uf.") + names[op == FAdd ? 0 : op == FSub ? 1
-                                          : op == FMul ? 2 : op == FDiv ? 3 : 4];
-    bool commutative = op == FAdd || op == FMul;
-    fn = [name, commutative](const expr &a, const expr &b, const expr &rm) {
-      string n = name + "." + to_string(a.float2BV().bits());
-      if (!commutative)
-        return expr::mkUF(n, {a, b, rm}, a);
-      // a + b = b + a (LLVM: also for NaNs, whose payload is unspecified):
-      // the operands in the order of their bits
-      auto first = a.float2BV().ule(b.float2BV());
-      return expr::mkIf(first, expr::mkUF(n, {a, b, rm}, a),
-                        expr::mkUF(n, {b, a, rm}, a));
-    };
-  }
-
   auto scalar = [&](const auto &a, const auto &b, const Type &ty) {
+    if (config::fp_uf && (op == FAdd || op == FSub || op == FMul ||
+                          op == FDiv || op == FRem)) {
+      static const char *names[] = {"fadd", "fsub", "fmul", "fdiv", "frem"};
+      unsigned k = op == FAdd ? 0 : op == FSub ? 1 : op == FMul ? 2
+                 : op == FDiv ? 3 : 4;
+      return fp_uf_value(s, names[k], {a, b}, ty, fmath, rm,
+                         /*commutative=*/k == 0 || k == 2);
+    }
     return fm_poison(s, a.value, a.non_poison, b.value, b.non_poison, fn,
                      ty, fmath, rm, bitwise);
   };
@@ -1717,18 +1742,12 @@ StateValue FpTernaryOp::toSMT(State &s) const {
     };
     break;
   }
-  if (config::fp_uf) {
-    string name = op == FMA ? "fp_uf.fma" : "fp_uf.fmuladd";
-    fn = [name](const expr &a, const expr &b, const expr &c, const expr &rm) {
-      string n = name + "." + to_string(a.float2BV().bits());
-      auto first = a.float2BV().ule(b.float2BV());
-      return expr::mkIf(first, expr::mkUF(n, {a, b, c, rm}, a),
-                        expr::mkUF(n, {b, a, c, rm}, a));
-    };
-  }
 
   auto scalar = [&](const StateValue &a, const StateValue &b,
                     const StateValue &c, const Type &ty) {
+    if (config::fp_uf)
+      return fp_uf_value(s, op == FMA ? "fma" : "fmuladd", {a, b, c}, ty,
+                         fmath, rm, /*commutative=*/true);
     return fm_poison(s, a.value, a.non_poison, b.value, b.non_poison,
                      c.value, c.non_poison, fn, ty, fmath, rm, false);
   };
