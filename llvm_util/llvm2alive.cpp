@@ -1506,6 +1506,9 @@ public:
         // non-relevant for correctness
         if (ID == Node->getContext().getMDKindID("irce.loop.clone"))
           break;
+        // read by parse_fmath (FastMathFlags::KeepDenormals)
+        if (ID == Node->getContext().getMDKindID("agx.keep-denormals"))
+          break;
 
         // For the target, dropping metadata is fine as metadata will never turn
         // a incorrect function into a correct one.

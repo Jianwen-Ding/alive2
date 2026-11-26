@@ -622,6 +622,8 @@ ostream& operator<<(ostream &os, const FastMathFlags &fm) {
     os << "reassoc ";
   if (fm.flags & FastMathFlags::AFN)
     os << "afn ";
+  if (fm.flags & FastMathFlags::KeepDenormals)
+    os << "!agx.keep-denormals ";
   return os;
 }
 

@@ -191,7 +191,11 @@ struct FastMathFlags final {
   enum Flags {
     None = 0, NNaN = 1 << 0, NInf = 1 << 1, NSZ = 1 << 2, ARCP = 1 << 3,
     Contract = 1 << 4, Reassoc = 1 << 5, AFN = 1 << 6,
-    FastMath = NNaN | NInf | NSZ | ARCP | Contract | Reassoc | AFN
+    FastMath = NNaN | NInf | NSZ | ARCP | Contract | Reassoc | AFN,
+    // !agx.keep-denormals: the operation keeps subnormal operands and results
+    // whatever its function's denormal mode (an IEEE operation in flushing
+    // code, llvm/docs/AGXUsage.rst); not a fast-math flag
+    KeepDenormals = 1 << 7
   };
   unsigned flags = None;
 

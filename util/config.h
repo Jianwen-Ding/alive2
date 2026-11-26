@@ -19,6 +19,11 @@ extern bool disable_poison_input;
 
 extern bool disable_undef_input;
 
+/// Floating point arithmetic (fadd, fsub, fmul, fdiv, frem, fma, fmuladd) as
+/// uninterpreted functions of the operands (and rounding mode): sound, cheap,
+/// proves only transformations that keep each operation (--fp-uf)
+extern bool fp_uf;
+
 // Give code for Apple GPUs (upstream GPU IR, AIR, AGX IR) its semantics
 // (llvm_util/gpu.h).
 extern bool gpu_semantics;

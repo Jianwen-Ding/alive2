@@ -11,6 +11,7 @@ config::src_unroll_cnt = opt_unrolling_factor;
 config::tgt_unroll_cnt = opt_unrolling_factor;
 #endif
 config::disable_undef_input = opt_disable_undef;
+config::fp_uf = opt_fp_uf;
 config::disable_poison_input = opt_disable_poison;
 config::gpu_semantics = opt_gpu_semantics;
 config::gpu_print_canonical = opt_gpu_print_canonical;

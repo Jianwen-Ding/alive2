@@ -32,6 +32,12 @@ llvm::cl::opt<unsigned> opt_unrolling_factor(LLVM_ARGS_PREFIX "unroll",
   llvm::cl::init(0), llvm::cl::cat(alive_cmdargs));
 #endif
 
+llvm::cl::opt<bool> opt_fp_uf(LLVM_ARGS_PREFIX "fp-uf",
+  llvm::cl::desc("Floating point arithmetic as uninterpreted functions of the "
+                 "operands: sound, fast, proves only transformations that keep "
+                 "each operation (default=false)"),
+  llvm::cl::init(false), llvm::cl::cat(alive_cmdargs));
+
 llvm::cl::opt<bool> opt_disable_undef(LLVM_ARGS_PREFIX "disable-undef-input",
   llvm::cl::desc("Assume inputs are not undef (default=false)"),
   llvm::cl::init(false), llvm::cl::cat(alive_cmdargs));

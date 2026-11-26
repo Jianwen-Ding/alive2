@@ -15,6 +15,7 @@ bool skip_smt = false;
 string smt_benchmark_dir;
 bool disable_poison_input = false;
 bool disable_undef_input = false;
+bool fp_uf = false;
 bool gpu_semantics = true;
 bool gpu_print_canonical = false;
 bool tgt_is_asm = false;

@@ -816,8 +816,11 @@ static StateValue fm_poison(State &s, expr a, const expr &ap, expr b,
   if (nary >= 3)
     fp_c = fpty.getFloat(c);
 
+  bool keep_denormals = fmath.flags & FastMathFlags::KeepDenormals;
   if (!bitwise) {
-    auto fpdenormal = s.getFn().getFnAttrs().getFPDenormal(from_ty).input;
+    auto fpdenormal = keep_denormals
+                        ? FPDenormalAttrs::IEEE
+                        : s.getFn().getFnAttrs().getFPDenormal(from_ty).input;
     fp_a = handle_subnormal(s, fpdenormal, std::move(fp_a), /*mandatory=*/true);
     if (nary >= 2)
       fp_b = handle_subnormal(s, fpdenormal, std::move(fp_b), /*mandatory=*/true);
@@ -870,7 +873,9 @@ static StateValue fm_poison(State &s, expr a, const expr &ap, expr b,
     // by the mode of the result's type rather than that of the operands; these
     // differ for casts between floating-point types
     val = handle_subnormal(s,
-                           s.getFn().getFnAttrs().getFPDenormal(ty).output,
+                           keep_denormals
+                             ? FPDenormalAttrs::IEEE
+                             : s.getFn().getFnAttrs().getFPDenormal(ty).output,
                            std::move(val),
                            /*mandatory=*/false);
     val = ty.fromFloat(s, val, fpty, nary, a, b, c);
@@ -982,6 +987,24 @@ StateValue FpBinOp::toSMT(State &s) const {
       return a.copysign(b);
     };
     break;
+  }
+
+  if (config::fp_uf && (op == FAdd || op == FSub || op == FMul || op == FDiv ||
+                        op == FRem)) {
+    static const char *names[] = {"fadd", "fsub", "fmul", "fdiv", "frem"};
+    string name = string("fp_uf.") + names[op == FAdd ? 0 : op == FSub ? 1
+                                          : op == FMul ? 2 : op == FDiv ? 3 : 4];
+    bool commutative = op == FAdd || op == FMul;
+    fn = [name, commutative](const expr &a, const expr &b, const expr &rm) {
+      string n = name + "." + to_string(a.float2BV().bits());
+      if (!commutative)
+        return expr::mkUF(n, {a, b, rm}, a);
+      // a + b = b + a (LLVM: also for NaNs, whose payload is unspecified):
+      // the operands in the order of their bits
+      auto first = a.float2BV().ule(b.float2BV());
+      return expr::mkIf(first, expr::mkUF(n, {a, b, rm}, a),
+                        expr::mkUF(n, {b, a, rm}, a));
+    };
   }
 
   auto scalar = [&](const auto &a, const auto &b, const Type &ty) {
@@ -1693,6 +1716,15 @@ StateValue FpTernaryOp::toSMT(State &s) const {
       return expr::mkIf(var, expr::fma(a, b, c, rm), a.fmul(b, rm).fadd(c, rm));
     };
     break;
+  }
+  if (config::fp_uf) {
+    string name = op == FMA ? "fp_uf.fma" : "fp_uf.fmuladd";
+    fn = [name](const expr &a, const expr &b, const expr &c, const expr &rm) {
+      string n = name + "." + to_string(a.float2BV().bits());
+      auto first = a.float2BV().ule(b.float2BV());
+      return expr::mkIf(first, expr::mkUF(n, {a, b, c, rm}, a),
+                        expr::mkUF(n, {b, a, c, rm}, a));
+    };
   }
 
   auto scalar = [&](const StateValue &a, const StateValue &b,

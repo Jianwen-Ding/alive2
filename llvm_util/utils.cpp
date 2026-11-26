@@ -90,6 +90,8 @@ FastMathFlags parse_fmath(llvm::Instruction &i) {
     if (op->hasApproxFunc())
       fmath.flags |= FastMathFlags::AFN;
   }
+  if (i.getMetadata("agx.keep-denormals"))
+    fmath.flags |= FastMathFlags::KeepDenormals;
   return fmath;
 }
 
