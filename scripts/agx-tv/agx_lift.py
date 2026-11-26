@@ -708,7 +708,9 @@ class Lifter:
         pi = self.op('ptrtoint %s %s to i64' % (p.type, p.name))
         m = self.op('and i64 %s, %d' % (pi, esz - 1))
         off = self.op('sub i64 %s, %s' % (off, m))
+      self.addr_type = p.type
       return self.op('getelementptr i8, %s %s, i64 %s' % (p.type, p.name, off))
+    self.addr_type = 'ptr addrspace(1)'
     b = self.read(base, 64, signed=False)
     if esz > 1:
       # The base rounds down to the item size.
@@ -721,6 +723,7 @@ class Lifter:
       return self.op('inttoptr i64 %s to ptr addrspace(1)' % a)
     pi = self.op('ptrtoint %s %s to i64' % (p.type, p.name))
     d = self.op('sub i64 %s, %s' % (a, pi))
+    self.addr_type = p.type
     return self.op('getelementptr i8, %s %s, i64 %s' % (p.type, p.name, d))
 
   def masked(self, act, fn):
@@ -1348,15 +1351,17 @@ class Lifter:
 
     def body():
       p = self.address(A, Oi, sgn, scale, esz)
+      # The address's space: a device or (not by reference) constant buffer.
+      pty = self.addr_type
       for k, pos in enumerate(positions):
-        q = self.op('getelementptr %s, ptr addrspace(1) %s, i64 %d'
-                    % (ty, p, pos)) if pos else p
+        q = self.op('getelementptr %s, %s %s, i64 %d'
+                    % (ty, pty, p, pos)) if pos else p
         reg = Operand(parts[k])
         rbits = reg.bits
         if mn == 'device_load':
           # Aligned to the item: the base rounds down to it and the offsets
           # are multiples of it (which spares alive2 modeling single bytes).
-          v = self.op('load %s, ptr addrspace(1) %s, align %d' % (ty, q, esz))
+          v = self.op('load %s, %s %s, align %d' % (ty, pty, q, esz))
           if 8 * esz < rbits:
             v = self.op('zext %s %s to i%d' % (ty, v, rbits))
           # Its registers are written at the wait on its slot.
@@ -1368,8 +1373,8 @@ class Lifter:
           self.pending.append((int(g), reg, val, flag, rbits))
         else:
           v = self.read(reg, 8 * esz)
-          self.emit('store %s %s, ptr addrspace(1) %s, align %d'
-                    % (ty, v, q, esz))
+          self.emit('store %s %s, %s %s, align %d'
+                    % (ty, v, pty, q, esz))
     self.masked(act, body)
 
   # -- the function ---------------------------------------------------------
