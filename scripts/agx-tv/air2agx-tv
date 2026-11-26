@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Translation validation of llvm-air2agx, the .air / .metallib -> AGX path,
+# on a kernel as a front end writes it for the AIR target:
+#
+#   1. llc -mtriple=air -filetype=obj   kernel.ll -> kernel.metallib (the AIR
+#      Metal's driver takes: typed-pointer bitcode in the container)
+#   2. llvm-air2agx --emit=llvm / asm   kernel.metallib -> optimized AGX IR and
+#      its machine code, as the tool compiles them (agx-lower-air, -O3, llc)
+#   3. alive-tv kernel.ll kernel.agx.ll             front end -> AGX IR
+#      alive-tv kernel.air.ll kernel.agx.ll         AIR read back -> AGX IR
+#   4. agx-tv --asm kernel.s kernel.agx.ll          AGX IR -> machine code
+#
+# so that the machine code refines the kernel, through the .metallib.
+#
+#   air2agx-tv [-mcpu=agx-g14c] [--keep DIR] kernel.ll [alive-tv options...]
+#
+# LLC, OPT, LLVM_DIS, AIR2AGX and ALIVE_TV name the tools (default: on PATH).
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+LLC=${LLC:-llc}
+OPT=${OPT:-opt}
+LLVM_DIS=${LLVM_DIS:-llvm-dis}
+AIR2AGX=${AIR2AGX:-llvm-air2agx}
+ALIVE_TV=${ALIVE_TV:-alive-tv}
+cpu=agx-g14c
+keep=
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -mcpu=*) cpu=${1#-mcpu=}; shift ;;
+    --keep) keep=$2; shift 2 ;;
+    *) break ;;
+  esac
+done
+in=$1; shift
+dir=${keep:-$(mktemp -d)}
+mkdir -p "$dir"
+k=$(basename "$in" .ll)
+
+"$LLC" -mtriple=air -filetype=obj "$in" -o "$dir/$k.metallib"
+"$AIR2AGX" --list "$dir/$k.metallib"
+"$AIR2AGX" -mcpu="$cpu" --emit=llvm "$dir/$k.metallib" -o "$dir/$k.agx.ll"
+"$AIR2AGX" -mcpu="$cpu" --emit=asm "$dir/$k.metallib" -o "$dir/$k.s"
+# The AIR as the tool reads it back from the container (opaque pointers).
+"$AIR2AGX" -O0 --emit=bc "$dir/$k.metallib" -o /dev/null
+python3 - "$dir/$k.metallib" "$dir/$k.air.bc" <<'EOF'
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+off, size = struct.unpack_from('<QQ', d, 76)
+open(sys.argv[2], 'wb').write(d[off:off + size])
+EOF
+"$LLVM_DIS" "$dir/$k.air.bc" -o "$dir/$k.air.ll"
+
+status=0
+echo "== front end -> AGX IR ($k.ll -> $k.agx.ll)"
+"$ALIVE_TV" "$in" "$dir/$k.agx.ll" "$@" || status=1
+echo "== AIR from the .metallib -> AGX IR ($k.air.ll -> $k.agx.ll)"
+"$ALIVE_TV" "$dir/$k.air.ll" "$dir/$k.agx.ll" "$@" || status=1
+echo "== AGX IR -> machine code"
+LLC=$LLC OPT=$OPT ALIVE_TV=$ALIVE_TV "$here/agx-tv" -mcpu="$cpu" \
+  --asm "$dir/$k.s" "$dir/$k.agx.ll" "$@" || status=1
+[[ -z $keep ]] && rm -rf "$dir"
+exit $status
