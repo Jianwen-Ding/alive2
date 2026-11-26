@@ -6,11 +6,17 @@
 #      Metal's driver takes: typed-pointer bitcode in the container)
 #   2. llvm-air2agx --emit=llvm / asm   kernel.metallib -> optimized AGX IR and
 #      its machine code, as the tool compiles them (agx-lower-air, -O3, llc)
-#   3. alive-tv kernel.ll kernel.agx.ll             front end -> AGX IR
-#      alive-tv kernel.air.ll kernel.agx.ll         AIR read back -> AGX IR
+#   3. alive-tv kernel.air.ll kernel.agx.ll         AIR in the container -> AGX IR
 #   4. agx-tv --asm kernel.s kernel.agx.ll          AGX IR -> machine code
 #
-# so that the machine code refines the kernel, through the .metallib.
+# so that the machine code refines the AIR the .metallib holds. (The AIR is
+# not the front end's kernel: the Metal pipeline packs its scalars into one
+# device buffer for Triton's host, a different signature; alive-tv compares
+# the front end with the portable AIR, tests/alive-tv/gpu.)
+#
+# alive2 does not read scoped alias metadata (!alias.scope, !noalias), which
+# the Metal pipeline gives the AIR: both sides lose it. That only drops UB
+# (aliasing the metadata rules out), so a proof without it still holds.
 #
 #   air2agx-tv [-mcpu=agx-g14c] [--keep DIR] kernel.ll [alive-tv options...]
 #
@@ -45,14 +51,15 @@ k=$(basename "$in" .ll)
 python3 - "$dir/$k.metallib" "$dir/$k.air.bc" <<'EOF'
 import struct, sys
 d = open(sys.argv[1], 'rb').read()
-off, size = struct.unpack_from('<QQ', d, 76)
+off, size = struct.unpack_from('<QQ', d, 72)
 open(sys.argv[2], 'wb').write(d[off:off + size])
 EOF
 "$LLVM_DIS" "$dir/$k.air.bc" -o "$dir/$k.air.ll"
+for f in "$dir/$k.air.ll" "$dir/$k.agx.ll"; do
+  sed -E -i 's/, !(alias\.scope|noalias) ![0-9]+//g' "$f"
+done
 
 status=0
-echo "== front end -> AGX IR ($k.ll -> $k.agx.ll)"
-"$ALIVE_TV" "$in" "$dir/$k.agx.ll" "$@" || status=1
 echo "== AIR from the .metallib -> AGX IR ($k.air.ll -> $k.agx.ll)"
 "$ALIVE_TV" "$dir/$k.air.ll" "$dir/$k.agx.ll" "$@" || status=1
 echo "== AGX IR -> machine code"
