@@ -755,6 +755,11 @@ struct GPUCanonicalizer : ValueMaterializer {
           Unsupported.addAttribute(At.getKindAsEnum());
       A.removeAttrs(Unsupported);
     }
+    // The dynamic threadgroup memory has the alignment its variable declares.
+    if (DynTG)
+      if (MaybeAlign Al = DynTG->getAlign())
+        NewF->getArg(NewF->arg_size() - 1)->addAttr(
+            Attribute::getWithAlignment(NewF->getContext(), *Al));
     // A constant buffer of a value, as the AIR target describes it.
     for (unsigned J = 0; J < Kept.size(); ++J)
       if (ByValue.count(Kept[J])) {
