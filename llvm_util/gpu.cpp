@@ -459,6 +459,71 @@ struct GPUCanonicalizer : ValueMaterializer {
     return R;
   }
 
+  /// Whether V is used only by instructions of Fns (through constants).
+  static bool usedOnlyBy(const Value &V, ArrayRef<const Function *> Fns) {
+    for (const User *U : V.users()) {
+      if (auto *I = dyn_cast<Instruction>(U)) {
+        if (!is_contained(Fns, I->getFunction()))
+          return false;
+      } else if (!isa<Constant>(U) || !usedOnlyBy(*U, Fns)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /// Every thread of a launch runs this function (and no other function of
+  /// the module uses the variable), so a threadgroup variable
+  /// the function never reads, passes on or compares (it only stores to it)
+  /// is read by no thread: its stores are dead. Without this, a fence (an
+  /// unknown function, standing for other threads) could read it, and a
+  /// pass that deletes such a variable (IPSCCP, GlobalOpt) would not verify.
+  void dropWriteOnlyThreadgroupVariables(Function &NewF, Function &Inlined,
+                                         ValueToValueMapTy &VMap) {
+    for (GlobalVariable &G : M.globals()) {
+      if (G.getAddressSpace() != AIRThreadgroup ||
+          isDynamicThreadgroupMemory(G) || !usedOnlyBy(G, {&F, &Inlined}))
+        continue;
+      auto It = VMap.find(&G);
+      if (It == VMap.end())
+        continue;
+      Value *V = It->second;
+      SmallVector<StoreInst *, 4> Stores;
+      SmallVector<Value *, 8> Work{V};
+      SmallPtrSet<Value *, 8> Seen;
+      bool WriteOnly = true;
+      while (WriteOnly && !Work.empty()) {
+        Value *P = Work.pop_back_val();
+        if (!Seen.insert(P).second)
+          continue;
+        for (User *U : P->users()) {
+          if (auto *S = dyn_cast<StoreInst>(U);
+              S && S->getPointerOperand() == P && !S->isVolatile() &&
+              S->getValueOperand() != P && S->getFunction() == &NewF) {
+            Stores.push_back(S);
+          } else if (isa<GetElementPtrInst, BitCastInst, AddrSpaceCastInst>(U) ||
+                     (isa<ConstantExpr>(U) &&
+                      (cast<ConstantExpr>(U)->getOpcode() ==
+                           Instruction::GetElementPtr ||
+                       cast<ConstantExpr>(U)->isCast()))) {
+            if (auto *I = dyn_cast<Instruction>(U);
+                I && I->getFunction() != &NewF) {
+              WriteOnly = false;
+              break;
+            }
+            Work.push_back(U);
+          } else {
+            WriteOnly = false;
+            break;
+          }
+        }
+      }
+      if (WriteOnly)
+        for (StoreInst *S : Stores)
+          S->eraseFromParent();
+    }
+  }
+
   /// AGX's dynamic threadgroup memory: a zero-sized threadgroup variable
   /// without a definition.
   static bool isDynamicThreadgroupMemory(const GlobalVariable &G) {
@@ -660,6 +725,7 @@ struct GPUCanonicalizer : ValueMaterializer {
         C->replaceAllUsesWith(C->getOperand(0));
         C->eraseFromParent();
       }
+    dropWriteOnlyThreadgroupVariables(*NewF, *Src, VMap);
     for (unsigned J = 0; J < Kept.size(); ++J)
       NewF->getArg(J)->setName(Kept[J]->getName());
     for (Argument *A : Trailing)
